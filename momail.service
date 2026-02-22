@@ -1,0 +1,15 @@
+[Unit]
+Description=MoMail FidoNet Mailer
+After=network.target
+
+[Service]
+Type=simple
+User=eugene
+Group=eugene
+WorkingDirectory=/home/eugene/ftn/momail
+ExecStart=/home/eugene/ftn/momail/momail -c ./run/config/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

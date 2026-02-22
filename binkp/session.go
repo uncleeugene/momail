@@ -1,0 +1,978 @@
+package binkp
+
+import (
+	"bufio"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"uncleeugene.kz/momail/config"
+	"uncleeugene.kz/momail/ftn"
+	"uncleeugene.kz/momail/logutil"
+	"uncleeugene.kz/momail/monitor"
+	"uncleeugene.kz/momail/nodelist"
+)
+
+// BinkP Commands (v1.0+)
+const (
+	M_NUL  = 0
+	M_ADR  = 1
+	M_PWD  = 2
+	M_FILE = 3
+	M_OK   = 4
+	M_EOB  = 5
+	M_GOT  = 6
+	M_ERR  = 7
+	M_BSY  = 8
+	M_GET  = 9
+	M_SKIP = 10
+)
+
+// errSessionFinished is a sentinel error to signal a clean session shutdown.
+var errSessionFinished = errors.New("session finished normally")
+
+// ErrRemoteBusy indicates the remote system sent M_BSY.
+var ErrRemoteBusy = errors.New("remote system is busy")
+
+// OnSessionEnd is called when a session finishes.
+// success is true if the session completed without error.
+var OnSessionEnd func(success bool)
+
+// RequestedFile represents a file queued for sending via FREQ.
+type RequestedFile struct {
+	Path        string
+	SendAs      string // Optional: name to send as. If empty, uses filename.
+	DeleteAfter bool   // If true, delete file after sending.
+}
+
+// Session handles the state of a BinkP connection.
+type Session struct {
+	conn   net.Conn
+	config *config.Config
+	reader *bufio.Reader
+	id     string
+
+	// Receive state
+	currentFile   *os.File
+	recvName      string
+	recvTimestamp string
+	recvSize      int64
+	recvBytes     int64
+
+	// Remote addresses claimed in M_ADR
+	remoteAddrs []*ftn.FidoAddress
+
+	// activeLink is the authenticated link configuration (if any)
+	activeLink *config.Link
+
+	// Authentication state
+	ourChallenge    string
+	remoteChallenge string
+	pwdSent         bool
+
+	// remoteLink is the target link configuration for outgoing connections
+	remoteLink *config.Link
+
+	// pendingCommands holds triggers to be executed after session
+	pendingCommands []string
+
+	// requestedFiles holds paths to files requested by the remote system
+	requestedFiles []RequestedFile
+
+	// Statistics
+	startTime     time.Time
+	filesReceived int
+	bytesReceived int64
+	filesSent     int
+	bytesSent     int64
+}
+
+// NewSession creates a new BinkP session.
+func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link) *Session {
+	return &Session{
+		conn:       conn,
+		config:     cfg,
+		reader:     bufio.NewReader(conn),
+		remoteLink: remoteLink,
+		id:         conn.RemoteAddr().String(),
+		startTime:  time.Now(),
+	}
+}
+
+// Run starts the BinkP protocol loop.
+func (s *Session) Run() (err error) {
+	if monitor.IsMuted() {
+		return fmt.Errorf("system is muted")
+	}
+
+	s.updateMonitor("Handshake", "", 0, 0)
+	defer func() {
+		if s.currentFile != nil {
+			s.currentFile.Close()
+		}
+		s.executePendingTriggers()
+		s.logSummary(err)
+
+		finalState := "Finished"
+		if err != nil && err != errSessionFinished {
+			finalState = "Error"
+		}
+		s.updateMonitor(finalState, "", 0, 0)
+		monitor.UnregisterSession(s.id)
+		if OnSessionEnd != nil {
+			OnSessionEnd(err == nil)
+		}
+	}()
+
+	// 1. Send Handshake (SYS info and Address)
+	if err := s.sendHandshake(); err != nil {
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	// 2. Main Loop
+	for {
+		s.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		isCmd, payload, err := s.readFrame()
+		if err != nil {
+			if err == io.EOF {
+				return nil // Connection closed cleanly
+			}
+			return err
+		}
+
+		if isCmd {
+			if err := s.handleCommand(payload); err != nil {
+				if err == errSessionFinished {
+					return nil // Clean exit
+				}
+				return err
+			}
+		} else {
+			if err := s.handleData(payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (s *Session) sendHandshake() error {
+	// M_NUL is used for system info. Format: "KEY Value"
+	// Standard BinkP info keys
+	if s.config.SystemName != "" {
+		s.writeCommand(M_NUL, "SYS "+s.config.SystemName)
+	}
+	if s.config.Sysop != "" {
+		s.writeCommand(M_NUL, "ZYZ "+s.config.Sysop)
+	}
+	if s.config.Location != "" {
+		s.writeCommand(M_NUL, "LOC "+s.config.Location)
+	}
+	// NDL: NodeList flags/capabilities
+	s.writeCommand(M_NUL, "NDL "+s.config.NodelistFlags)
+	// VER: Software version
+	s.writeCommand(M_NUL, "VER momail v0.1. binkp/1.0")
+
+	// CRAM-MD5: Send our challenge
+	s.ourChallenge = generateChallenge()
+	s.writeCommand(M_NUL, "OPT CRAM-MD5-"+s.ourChallenge)
+
+	// M_ADR sends our address list
+	if err := s.writeCommand(M_ADR, s.config.ParsedAddress.String()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Session) writeCommand(cmd byte, data string) error {
+	// Frame: [Header (2 bytes)] [Cmd (1 byte)] [Data...]
+	// Header = Length | 0x8000 (Command Bit)
+	// Length includes the Cmd byte.
+	payloadLen := 1 + len(data)
+	buf := make([]byte, 2+payloadLen)
+
+	binary.BigEndian.PutUint16(buf[0:2], uint16(payloadLen)|0x8000)
+	buf[2] = cmd
+	copy(buf[3:], data)
+
+	_, err := s.conn.Write(buf)
+	return err
+}
+
+func (s *Session) readFrame() (bool, []byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(s.reader, header); err != nil {
+		return false, nil, err
+	}
+
+	val := binary.BigEndian.Uint16(header)
+	isCmd := (val & 0x8000) != 0
+	length := int(val & 0x7FFF)
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(s.reader, payload); err != nil {
+		return false, nil, err
+	}
+
+	return isCmd, payload, nil
+}
+
+func (s *Session) handleCommand(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	cmd := payload[0]
+	data := string(payload[1:])
+
+	switch cmd {
+	case M_NUL:
+		log.Println(logutil.Muted("[Remote] INFO: %s", data))
+		var challenge string
+		if strings.HasPrefix(data, "CRAM-MD5-") {
+			challenge = data[9:]
+		} else if strings.HasPrefix(data, "OPT ") {
+			for _, part := range strings.Fields(data) {
+				if strings.HasPrefix(part, "CRAM-MD5-") {
+					challenge = part[9:]
+					break
+				}
+			}
+		}
+		if challenge != "" {
+			s.remoteChallenge = challenge
+			// If we are outgoing and haven't sent PWD, send CRAM response now
+			if s.remoteLink != nil && !s.pwdSent {
+				s.sendCramResponse(s.remoteLink.Password)
+			}
+		}
+	case M_ADR:
+		log.Println(logutil.Remote("[Remote] ADR: %s", data))
+		parts := strings.Fields(data)
+		for _, p := range parts {
+			// Strip domain if present (e.g. 2:5020/828@fidonet)
+			if idx := strings.Index(p, "@"); idx != -1 {
+				p = p[:idx]
+			}
+			if addr, err := ftn.ParseFidoAddress(p, s.config.ParsedAddress.Zone); err == nil {
+				s.remoteAddrs = append(s.remoteAddrs, addr)
+			}
+		}
+
+		// Update monitor with the new address
+		s.updateMonitor("Handshake", "", 0, 0)
+
+		// If outgoing (we have a target link), check if we need to send password now (fallback to plain)
+		if s.remoteLink != nil && !s.pwdSent && s.remoteChallenge == "" {
+			if s.remoteLink.Password != "" {
+				s.writeCommand(M_PWD, s.remoteLink.Password)
+				s.pwdSent = true
+			}
+		}
+
+		// If incoming, try to identify link and respond to challenge if present (mutual auth)
+		if s.activeLink == nil {
+			if link := s.findLink(); link != nil {
+				if s.remoteChallenge != "" && !s.pwdSent {
+					s.sendCramResponse(link.Password)
+				} else if s.remoteChallenge == "" && !s.pwdSent && link.Password != "" {
+					// Fallback to plain text mutual auth if remote didn't send challenge
+					s.writeCommand(M_PWD, link.Password)
+					s.pwdSent = true
+				}
+			}
+		}
+	case M_PWD:
+		log.Println(logutil.Remote("[Remote] PWD: *****"))
+		link := s.findLink()
+		if link == nil {
+			// Unknown link, allow as insecure
+			log.Println(logutil.Warn("Unknown node (no address match), treating as unprotected session"))
+			s.writeCommand(M_OK, "Unprotected session")
+			return nil
+		}
+
+		// If a link is configured but has no password, it's a valid session.
+		if link.Password == "" {
+			s.activeLink = link
+			s.writeCommand(M_OK, "Password not required")
+			log.Println(logutil.Success("-> No password required for this link, accepted"))
+			return nil
+		}
+
+		valid := false
+		if strings.HasPrefix(data, "CRAM-MD5-") {
+			digest := data[9:]
+			mac := hmac.New(md5.New, []byte(link.Password))
+
+			// Method 1: Standard (Decode Hex Challenge)
+			challengeBytes, err := hex.DecodeString(s.ourChallenge)
+			if err != nil {
+				challengeBytes = []byte(s.ourChallenge)
+			}
+			mac.Write(challengeBytes)
+			expected := hex.EncodeToString(mac.Sum(nil))
+
+			if strings.EqualFold(digest, expected) {
+				valid = true
+			} else {
+				// Method 2: Fallback (Raw ASCII Challenge)
+				mac2 := hmac.New(md5.New, []byte(link.Password))
+				mac2.Write([]byte(s.ourChallenge))
+				expected2 := hex.EncodeToString(mac2.Sum(nil))
+				if strings.EqualFold(digest, expected2) {
+					valid = true
+				} else {
+					log.Println(logutil.Debug("CRAM-MD5 mismatch"))
+				}
+			}
+		} else if data == link.Password {
+			valid = true
+		}
+
+		if valid {
+			s.activeLink = link
+			s.writeCommand(M_OK, "Password accepted")
+			log.Println(logutil.Success("-> Password accepted"))
+		} else {
+			s.writeCommand(M_ERR, "Bad password")
+			return fmt.Errorf("authentication failed: bad password")
+		}
+	case M_OK:
+		log.Println(logutil.Muted("[Remote] OK: %s", data))
+		// If we are dialing out and the remote accepted our password, consider the session authenticated.
+		if s.remoteLink != nil && s.pwdSent && s.activeLink == nil {
+			s.activeLink = s.remoteLink
+			log.Println(logutil.Success("-> Remote accepted password, session considered protected"))
+		}
+	case M_FILE:
+		return s.handleFile(data)
+	case M_EOB:
+		return s.handleEOB()
+	case M_ERR:
+		log.Println(logutil.Error("[Remote] ERR: %s", data))
+		return fmt.Errorf("remote error: %s", data)
+	case M_BSY:
+		log.Println(logutil.Warn("[Remote] BSY: %s", data))
+		return ErrRemoteBusy
+	case M_GET:
+		return s.handleGet(data)
+	default:
+		log.Println(logutil.Muted("[Remote] CMD %d: %s", cmd, data))
+	}
+	return nil
+}
+
+func (s *Session) sendCramResponse(password string) error {
+	if password == "" {
+		return nil
+	}
+	mac := hmac.New(md5.New, []byte(password))
+	challengeBytes, err := hex.DecodeString(s.remoteChallenge)
+	if err != nil {
+		challengeBytes = []byte(s.remoteChallenge)
+	}
+	mac.Write(challengeBytes)
+	digest := hex.EncodeToString(mac.Sum(nil))
+	s.pwdSent = true
+	return s.writeCommand(M_PWD, "CRAM-MD5-"+digest)
+}
+
+func generateChallenge() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (s *Session) handleGet(args string) error {
+	if s.config.FreqDir == "" {
+		log.Println(logutil.Warn("Remote requested file '%s' but filebox is disabled", args))
+		return nil
+	}
+
+	// M_GET arguments: name [size] [time] [offset]
+	// We only care about the name for now.
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		return nil
+	}
+	name := parts[0]
+
+	if strings.EqualFold(name, "FILES") {
+		return s.handleMagicFiles()
+	}
+
+	if strings.EqualFold(name, "NODELIST") {
+		return s.handleMagicNodelist()
+	}
+
+	// Security: Prevent directory traversal
+	cleanPath := filepath.Clean(filepath.Join(s.config.FreqDir, name))
+	absFileBox, _ := filepath.Abs(s.config.FreqDir)
+	absPath, _ := filepath.Abs(cleanPath)
+
+	if !strings.HasPrefix(absPath, absFileBox) {
+		log.Println(logutil.Error("Security: Remote tried to access invalid path: %s", name))
+		return nil
+	}
+
+	if _, err := os.Stat(absPath); err != nil {
+		log.Println(logutil.Warn("Remote requested missing file: %s", name))
+		return nil
+	}
+
+	log.Println(logutil.Info("Queuing requested file: %s", name))
+	s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: absPath})
+	return nil
+}
+
+func (s *Session) handleMagicFiles() error {
+	if err := os.MkdirAll(s.config.TempInbound, 0755); err != nil {
+		log.Println(logutil.Error("Failed to create temp dir for magic file: %v", err))
+		return nil
+	}
+
+	f, err := os.CreateTemp(s.config.TempInbound, "FILES-*.LST")
+	if err != nil {
+		log.Println(logutil.Error("Failed to create magic file listing: %v", err))
+		return nil
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "File listing for %s\r\n", s.config.SystemName)
+	fmt.Fprintf(f, "-------------------------------------------------------------------------------\r\n")
+
+	entries, err := os.ReadDir(s.config.FreqDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				info, _ := entry.Info()
+				fmt.Fprintf(f, "%-30s %10d  %s\r\n", entry.Name(), info.Size(), info.ModTime().Format("2006-01-02 15:04"))
+			}
+		}
+	} else {
+		fmt.Fprintf(f, "Error reading filebox: %v\r\n", err)
+	}
+	fmt.Fprintf(f, "-------------------------------------------------------------------------------\r\n")
+
+	log.Println(logutil.Info("Queuing magic file: FILES"))
+	s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: f.Name(), SendAs: "FILES.LST", DeleteAfter: true})
+	return nil
+}
+
+func (s *Session) handleMagicNodelist() error {
+	if s.config.NodelistDir == "" {
+		log.Println(logutil.Warn("Remote requested NODELIST but nodelist_dir is not configured"))
+		return nil
+	}
+
+	// Try to find "nodelist" first as it is the standard name
+	path, err := nodelist.FindLatest(s.config.NodelistDir, "nodelist")
+
+	// If not found, and we have configured nodelists, try the first one
+	if err != nil && len(s.config.Nodelists) > 0 {
+		if !strings.EqualFold(s.config.Nodelists[0], "nodelist") {
+			path, err = nodelist.FindLatest(s.config.NodelistDir, s.config.Nodelists[0])
+		}
+	}
+
+	if err == nil && path != "" {
+		log.Println(logutil.Info("Queuing magic file: NODELIST -> %s", filepath.Base(path)))
+		s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: path})
+	} else {
+		log.Println(logutil.Warn("Remote requested NODELIST but no suitable file found in %s", s.config.NodelistDir))
+	}
+	return nil
+}
+
+// findLink attempts to find a configured link that matches one of the
+// remote system's addresses.
+func (s *Session) findLink() *config.Link {
+	for _, remoteAddr := range s.remoteAddrs {
+		for i := range s.config.Links {
+			link := &s.config.Links[i]
+			// Compare Zone, Net, Node. Ignore point for link matching.
+			if link.ParsedAddress.Zone == remoteAddr.Zone &&
+				link.ParsedAddress.Net == remoteAddr.Net &&
+				link.ParsedAddress.Node == remoteAddr.Node {
+				return link
+			}
+		}
+	}
+
+	// If we initiated the connection, fallback to the target link configuration.
+	// This handles cases where M_PWD arrives before M_ADR.
+	if s.remoteLink != nil {
+		return s.remoteLink
+	}
+	return nil
+}
+
+func (s *Session) handleFile(args string) error {
+	if s.currentFile != nil {
+		if err := s.finishCurrentFile(); err != nil {
+			return err
+		}
+	}
+
+	// M_FILE format: "filename size timestamp offset"
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return fmt.Errorf("malformed M_FILE: %s", args)
+	}
+
+	name := parts[0]
+	size, _ := strconv.ParseInt(parts[1], 10, 64)
+	timestamp := "0"
+	if len(parts) > 2 {
+		timestamp = parts[2]
+	}
+
+	// Security: Ensure we only write to the temp directory
+	baseName := filepath.Base(name)
+	if err := os.MkdirAll(s.config.TempInbound, 0755); err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	tmpPath := filepath.Join(s.config.TempInbound, baseName)
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		s.writeCommand(M_SKIP, name) // Tell remote to skip this file
+		return fmt.Errorf("failed to create file %s: %w", tmpPath, err)
+	}
+
+	s.currentFile = f
+	s.recvName = baseName
+	s.recvTimestamp = timestamp
+	s.recvSize = size
+	s.recvBytes = 0
+
+	s.updateMonitor("Receiving", baseName, 0, size)
+	log.Println(logutil.Warn("Receiving %s (%d bytes)...", baseName, size))
+	return nil
+}
+
+func (s *Session) handleData(data []byte) error {
+	if s.currentFile == nil {
+		return nil // Ignore data if no file is open
+	}
+	n, err := s.currentFile.Write(data)
+	if err != nil {
+		return err
+	}
+	s.recvBytes += int64(n)
+	s.updateMonitor("Receiving", s.recvName, s.recvBytes, s.recvSize)
+
+	if s.recvSize > 0 {
+		pct := float64(s.recvBytes) / float64(s.recvSize) * 100.0
+		fmt.Printf("\rReceiving %s: %.1f%% (%d/%d)...", s.recvName, pct, s.recvBytes, s.recvSize)
+
+		if s.recvBytes >= s.recvSize {
+			return s.finishCurrentFile()
+		}
+	} else {
+		fmt.Printf("\rReceiving %s: %d bytes...", s.recvName, s.recvBytes)
+	}
+	return nil
+}
+
+func (s *Session) handleEOB() error {
+	if s.currentFile != nil {
+		if err := s.finishCurrentFile(); err != nil {
+			return err
+		}
+	}
+
+	// It's our turn to send.
+	log.Println(logutil.Info("-> Remote finished sending. Starting outbound queue..."))
+	s.updateMonitor("Sending", "", 0, 0)
+	return s.sendFiles()
+}
+
+func (s *Session) finishCurrentFile() error {
+	fmt.Println() // Finish progress bar line
+	s.currentFile.Close()
+	s.currentFile = nil
+
+	var destDir string
+
+	// If not explicitly authenticated, check if we match a password-less link
+	if s.activeLink == nil {
+		if l := s.findLink(); l != nil && l.Password == "" {
+			s.activeLink = l
+		}
+	}
+
+	if s.activeLink != nil {
+		// Protected session
+		if s.config.SecureInbound != "" {
+			destDir = s.config.SecureInbound
+		} else {
+			destDir = s.config.InsecureInbound
+		}
+	} else {
+		// Unprotected session
+		destDir = s.config.InsecureInbound
+	}
+
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return err
+	}
+	src := filepath.Join(s.config.TempInbound, s.recvName)
+	dst := filepath.Join(destDir, s.recvName)
+
+	if err := os.Rename(src, dst); err != nil {
+		log.Println(logutil.Error("Error moving file to inbound: %v", err))
+	} else {
+		log.Println(logutil.Success("Received %s successfully.", s.recvName))
+
+		s.filesReceived++
+		s.bytesReceived += s.recvBytes
+
+		s.executeTriggers(dst)
+
+		// Send M_GOT to confirm receipt
+		// M_GOT args: filename size timestamp
+		return s.writeCommand(M_GOT, fmt.Sprintf("%s %d %s", s.recvName, s.recvBytes, s.recvTimestamp))
+	}
+	return nil
+}
+
+func (s *Session) executeTriggers(path string) {
+	filename := filepath.Base(path)
+	for _, t := range s.config.Triggers {
+		for _, mask := range t.Masks {
+			matched, err := filepath.Match(mask, filename)
+			if err != nil {
+				log.Println(logutil.Error("Error matching trigger mask '%s': %v\n", mask, err))
+				continue
+			}
+			if matched && t.Command != "" {
+				cmdStr := strings.ReplaceAll(t.Command, "{file}", path)
+				if t.RunAfterSession {
+					log.Println(logutil.Debug("Trigger match '%s': queueing for later '%s'\n", mask, cmdStr))
+					s.pendingCommands = append(s.pendingCommands, cmdStr)
+				} else {
+					log.Println(logutil.Debug("Trigger match '%s': executing '%s'\n", mask, cmdStr))
+					s.runCommand(cmdStr)
+				}
+				break
+			}
+		}
+	}
+}
+
+func (s *Session) executePendingTriggers() {
+	if len(s.pendingCommands) > 0 {
+		log.Println(logutil.Debug("Executing pending triggers..."))
+		for _, cmdStr := range s.pendingCommands {
+			s.runCommand(cmdStr)
+		}
+	}
+}
+
+func (s *Session) runCommand(cmdStr string) {
+	cmd := exec.Command("sh", "-c", cmdStr)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Println(logutil.Error("Trigger execution failed: %v\nOutput: %s\n", err, string(output)))
+	}
+}
+
+func (s *Session) sendFiles() error {
+	// If not explicitly authenticated, check if we match a password-less link
+	if s.activeLink == nil {
+		if l := s.findLink(); l != nil && l.Password == "" {
+			s.activeLink = l
+		}
+	}
+
+	if s.config.RefuseInsecureSending && s.activeLink == nil && s.remoteLink == nil {
+		log.Println(logutil.Warn("Session is insecure (unauthenticated). Skipping outbound files."))
+		if err := s.writeCommand(M_EOB, ""); err != nil {
+			return err
+		}
+		return fmt.Errorf("insecure session, outbound skipped")
+	}
+
+	// 1. Send requested files (FREQ)
+	for _, req := range s.requestedFiles {
+		if err := s.sendFile(req.Path, req.SendAs); err != nil {
+			return err
+		}
+		if req.DeleteAfter {
+			os.Remove(req.Path)
+		}
+	}
+
+	if len(s.remoteAddrs) == 0 {
+		s.writeCommand(M_EOB, "")
+		return errSessionFinished
+	}
+
+	// Iterate over all addresses the remote node claims to have
+	for _, addr := range s.remoteAddrs {
+		flowFiles := FindFlowFiles(s.config, addr)
+		for _, flowFile := range flowFiles {
+			if err := s.processFlowFile(flowFile.Path); err != nil {
+				return err
+			}
+		}
+	}
+
+	// We are done sending.
+	if err := s.writeCommand(M_EOB, ""); err != nil {
+		return err
+	}
+	return errSessionFinished
+}
+
+// FlowFileInfo holds information about a found flow file.
+type FlowFileInfo struct {
+	Path  string
+	State string // "Crash", "Normal", "Direct", "Hold"
+}
+
+// FindFlowFiles locates Binkley-style flow files.
+func FindFlowFiles(cfg *config.Config, remote *ftn.FidoAddress) []FlowFileInfo {
+	var flows []FlowFileInfo
+
+	// 1. Determine Base Directory
+	// If zones match: outbound/outbound
+	// If zones differ: outbound/outbound.ZZZ (hex zone)
+	var baseDir string
+	if remote.Zone == cfg.DefaultZone {
+		baseDir = filepath.Join(cfg.Outbound, "outbound")
+	} else {
+		baseDir = filepath.Join(cfg.Outbound, fmt.Sprintf("outbound.%03x", remote.Zone))
+	}
+
+	// 2. Determine Filename Base
+	var nameBase string
+	if remote.Point != 0 {
+		// Points: outbound/NNNNFFFF.pnt/0000PPPP
+		// NNNN=Net, FFFF=Node, PPPP=Point (all hex)
+		dir := filepath.Join(baseDir, fmt.Sprintf("%04x%04x.pnt", remote.Net, remote.Node))
+		baseDir = dir
+		nameBase = fmt.Sprintf("0000%04x", remote.Point)
+	} else {
+		// Nodes: outbound/NNNNFFFF
+		nameBase = fmt.Sprintf("%04x%04x", remote.Net, remote.Node)
+	}
+
+	// 3. Check extensions in priority order
+	extMap := map[string]string{
+		".clo": "Crash",
+		".cut": "Crash",
+		".dlo": "Direct",
+		".dut": "Direct",
+		".hlo": "Hold",
+		".hut": "Hold",
+		".lo":  "Normal",
+		".out": "Normal",
+		".flo": "Normal",
+		".fut": "Normal",
+	}
+	// Check in priority order
+	for _, ext := range []string{".clo", ".cut", ".dlo", ".dut", ".hlo", ".hut", ".lo", ".out", ".flo", ".fut"} {
+		path := filepath.Join(baseDir, nameBase+ext)
+		if _, err := os.Stat(path); err == nil {
+			flows = append(flows, FlowFileInfo{Path: path, State: extMap[ext]})
+		}
+	}
+	return flows
+}
+
+func (s *Session) processFlowFile(flowPath string) error {
+	log.Println(logutil.Debug("Processing flow file: %s", flowPath))
+	f, err := os.Open(flowPath)
+	if err != nil {
+		return nil // Skip if we can't open
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		deleteAfter := false
+		path := line
+		if strings.HasPrefix(line, "^") {
+			deleteAfter = true
+			path = line[1:]
+		}
+
+		// Send the file
+		if err := s.sendFile(path, ""); err != nil {
+			// If the file is missing, we just skip it (and it will be removed from flow later)
+			// If it's a network error, we return it to abort the session.
+			if os.IsNotExist(err) {
+				log.Println(logutil.Warn("File not found: %s", path))
+				continue
+			}
+			return err
+		}
+
+		// If successful and marked for deletion
+		if deleteAfter {
+			os.Remove(path)
+		}
+	}
+
+	// If we processed the whole file without network error, delete the flow file
+	f.Close()
+	os.Remove(flowPath)
+	return nil
+}
+
+func (s *Session) sendFile(path string, sendAs string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	name := sendAs
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	log.Println(logutil.Warn("Sending %s (%d bytes)...", name, info.Size()))
+	s.updateMonitor("Sending", name, 0, info.Size())
+
+	// M_FILE: "name size timestamp offset"
+	fileArgs := fmt.Sprintf("%s %d %d 0", name, info.Size(), info.ModTime().Unix())
+	if err := s.writeCommand(M_FILE, fileArgs); err != nil {
+		return err
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4096)
+	var sentBytes int64
+	for {
+		n, err := f.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if err := s.writeData(buf[:n]); err != nil {
+			return err
+		}
+		s.bytesSent += int64(n)
+		sentBytes += int64(n)
+		s.updateMonitor("Sending", name, sentBytes, info.Size())
+	}
+	s.filesSent++
+	return nil
+}
+
+func (s *Session) writeData(data []byte) error {
+	// Frame: [Header (2 bytes)] [Data...]
+	// Header = Length (15 bits). High bit is 0 for data.
+	payloadLen := len(data)
+	buf := make([]byte, 2+payloadLen)
+
+	binary.BigEndian.PutUint16(buf[0:2], uint16(payloadLen))
+	copy(buf[2:], data)
+
+	_, err := s.conn.Write(buf)
+	return err
+}
+
+func (s *Session) logSummary(err error) {
+	duration := time.Since(s.startTime)
+	direction := "IN"
+	directionColored := logutil.Debug("IN")
+	if s.remoteLink != nil {
+		direction = "OUT"
+		directionColored = logutil.Debug("OUT")
+	}
+
+	status := "OK"
+	statusColored := logutil.Success("OK")
+	if err != nil && err != errSessionFinished {
+		status = "ERR"
+		statusColored = logutil.Error("ERR")
+	}
+
+	remote := "unknown"
+	if len(s.remoteAddrs) > 0 {
+		remote = s.remoteAddrs[0].String()
+	} else if s.remoteLink != nil {
+		remote = s.remoteLink.Address
+	}
+
+	remoteColored := logutil.Remote(remote)
+
+	summary := fmt.Sprintf("SESSION %s %s %s R:%d/%d S:%d/%d Time:%s",
+		directionColored, remoteColored, statusColored,
+		s.filesReceived, s.bytesReceived,
+		s.filesSent, s.bytesSent,
+		duration.Round(time.Millisecond))
+
+	if s.config.SessionLog != "" {
+		f, err := os.OpenFile(s.config.SessionLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Println(logutil.Error("Failed to open session log: %v", err))
+			// Fallback to main log on error
+			log.Println(summary)
+		} else {
+			// Write to session log without color
+			fmt.Fprintf(f, "%s SESSION %s %s %s R:%d/%d S:%d/%d Time:%s\n", time.Now().Format("2006/01/02 15:04:05"), direction, remote, status, s.filesReceived, s.bytesReceived, s.filesSent, s.bytesSent, duration.Round(time.Millisecond))
+			f.Close()
+		}
+	} else {
+		// No separate session log, write summary to main log
+		log.Println(summary)
+	}
+}
+
+func (s *Session) updateMonitor(state, file string, pos, size int64) {
+	direction := "IN"
+	if s.remoteLink != nil {
+		direction = "OUT"
+	}
+
+	remote := s.conn.RemoteAddr().String()
+	if len(s.remoteAddrs) > 0 {
+		remote = s.remoteAddrs[0].String()
+	} else if s.remoteLink != nil {
+		remote = s.remoteLink.Address
+	}
+
+	var endTime time.Time
+	if state == "Finished" || state == "Error" {
+		endTime = time.Now()
+	}
+
+	monitor.RegisterSession(s.id, monitor.SessionInfo{
+		ID:          s.id,
+		Remote:      remote,
+		Direction:   direction,
+		State:       state,
+		CurrentFile: file,
+		FilePos:     pos,
+		FileSize:    size,
+		StartedAt:   s.startTime,
+		EndTime:     endTime,
+	})
+}

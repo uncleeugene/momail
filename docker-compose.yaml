@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  momail:
+    build: .
+    image: momail:latest
+    container_name: momail
+    restart: unless-stopped
+    ports:
+      - "24554:24554" # BinkP
+      - "8080:8080"   # API / Dashboard
+    volumes:
+      - ./run:/app/run
+    # Set timezone to ensure logs and cron schedules match your local time
+    environment:
+      - TZ=Asia/Almaty 

@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoMail Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f9; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 20px; }
+        h2 { margin-top: 0; border-bottom: 2px solid #eee; padding-bottom: 10px; font-size: 1.2em; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .layout-row { display: grid; grid-template-columns: 1fr 3fr; gap: 20px; }
+        @media (max-width: 768px) { .layout-row { grid-template-columns: 1fr; } }
+        .stat-item { margin-bottom: 10px; }
+        .label { font-weight: bold; color: #666; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
+        th { background-color: #f8f9fa; font-weight: 600; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
+        .badge-green { background-color: #d4edda; color: #155724; }
+        .badge-yellow { background-color: #fff3cd; color: #856404; }
+        .badge-red { background-color: #f8d7da; color: #721c24; }
+        .badge-blue { background-color: #cce5ff; color: #004085; }
+        #log-view {
+            background-color: #2b2b2b;
+            color: #f1f1f1;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            font-size: 0.85em;
+            padding: 15px;
+            border-radius: 4px;
+            height: 400px;
+            overflow-y: scroll;
+            white-space: pre-wrap;
+        }
+        /* Modal Styles */
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
+        .modal-content { background-color: #fefefe; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 300px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+        .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
+        .close:hover, .close:focus { color: black; text-decoration: none; cursor: pointer; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .form-group select { width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ddd; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .btn-primary { background-color: #007bff; color: white; }
+        .btn-secondary { background-color: #6c757d; color: white; margin-right: 10px; }
+        .btn-danger { background-color: #dc3545; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>MoMail Dashboard</h1>
+            <div id="connection-status" class="badge badge-yellow">Connecting...</div>
+        </div>
+
+        <div id="status-view">
+        <div class="layout-row">
+            <div class="card">
+                <h2>System Status</h2>
+                <div class="stat-item"><span class="label">Address:</span> <span id="sys-addr">-</span></div>
+                <div class="stat-item"><span class="label">Uptime:</span> <span id="sys-uptime">-</span></div>
+                <div class="stat-item"><span class="label">Version:</span> <span id="sys-ver">-</span></div>
+                <div class="stat-item"><span class="label">Next Scan:</span> <span id="sys-scan">-</span></div>
+                <div style="margin-top: 15px; display: flex; gap: 10px;">
+                    <button id="btn-mute" class="btn btn-secondary" onclick="toggleMute()" style="flex:1">Mute mailer</button>
+                    <button class="btn btn-primary" onclick="forceScan()" style="flex:1">Force rescan</button>
+                    <button class="btn btn-secondary" onclick="reloadConfig()" style="flex:1">Reload configuration</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 10px;">
+                    <h2 style="border-bottom: none; margin-bottom: 0; padding-bottom: 0;">Outbound Queue</h2>
+                    <button class="btn btn-primary" onclick="openAddPollModal()" style="padding: 4px 12px; font-size: 0.9em;">+ Poll</button>
+                </div>
+                <div style="overflow-x: auto;">
+                    <table id="queue-table">
+                        <thead>
+                            <tr>
+                                <th>Address</th>
+                                <th>Flavor</th>
+                                <th>Files</th>
+                                <th>Netmail</th>
+                                <th>Echomail</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="7">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Recent Sessions</h2>
+            <div style="overflow-x: auto;">
+                <table id="sessions-table">
+                    <thead>
+                        <tr>
+                            <th>Started</th>
+                            <th>Duration</th>
+                            <th>Dir</th>
+                            <th>Remote</th>
+                            <th>State</th>
+                            <th>File</th>
+                            <th>Progress</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td colspan="7">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        </div>
+
+        <div class="card">
+            <h2>Live Log</h2>
+            <div id="log-view">
+                <div id="log-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Poll Modal -->
+    <div id="addPollModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeAddPollModal()">&times;</span>
+            <h2>Add Poll</h2>
+            <div class="form-group">
+                <label for="pollAddress">Node Address:</label>
+                <input type="text" id="pollAddress" placeholder="e.g. 2:5020/828" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ddd; box-sizing: border-box;">
+            </div>
+            <div class="form-group">
+                <label for="pollFlavor">Flavor:</label>
+                <select id="pollFlavor">
+                    <option value="normal">Normal</option>
+                    <option value="crash">Crash</option>
+                    <option value="direct">Direct</option>
+                    <option value="hold">Hold</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label style="font-weight:normal; cursor:pointer;">
+                    <input type="checkbox" id="pollSuspended"> Suspend immediately
+                </label>
+            </div>
+            <div style="text-align: right;">
+                <button class="btn btn-secondary" onclick="closeAddPollModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitAddPoll()">Add</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Node Info Modal -->
+    <div id="nodeInfoModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeNodeInfoModal()">&times;</span>
+            <h2>Node Information</h2>
+            <div class="form-group">
+                <label>Address:</label> <span id="infoAddress"></span>
+            </div>
+            <div class="form-group">
+                <label>Sysop:</label> <span id="infoSysop"></span>
+            </div>
+            <div class="form-group">
+                <label>Location:</label> <span id="infoLocation"></span>
+            </div>
+            <div class="form-group">
+                <label>Flags:</label> <div id="infoFlags" style="font-family:monospace; font-size:0.9em; word-break: break-all;"></div>
+            </div>
+            <hr style="margin: 15px 0; border: 0; border-top: 1px solid #eee;">
+            <div class="form-group">
+                <label>DNS Root:</label> <span id="infoDNSRoot"></span>
+            </div>
+            <div class="form-group">
+                <label>Resolved:</label> <span id="infoDNS"></span>
+            </div>
+            <div style="text-align: right; margin-top: 20px;">
+                <button class="btn btn-primary" onclick="closeNodeInfoModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Flavor Edit Modal -->
+    <div id="flavorModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeFlavorModal()">&times;</span>
+            <h2>Change Flavor</h2>
+            <div class="form-group">
+                <label>Address: <span id="flavorAddress" style="font-weight:normal"></span></label>
+            </div>
+            <div class="form-group">
+                <label for="flavorSelect">New Flavor:</label>
+                <select id="flavorSelect">
+                    <option value="Crash">Crash</option>
+                    <option value="Direct">Direct</option>
+                    <option value="Hold">Hold</option>
+                    <option value="Normal">Normal</option>
+                </select>
+            </div>
+            <div style="text-align: right;">
+                <button class="btn btn-secondary" onclick="closeFlavorModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveFlavor()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Poll Modal -->
+    <div id="deleteModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeDeleteModal()">&times;</span>
+            <h2>Delete Poll</h2>
+            <p>Are you sure you want to delete the poll for <span id="deleteAddress" style="font-weight:bold"></span>?</p>
+            <div class="form-group">
+                <label style="font-weight:normal; cursor:pointer;">
+                    <input type="checkbox" id="deleteFilesCheckbox"> Also delete associated files (bundles, packets)
+                </label>
+            </div>
+            <div style="text-align: right;">
+                <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
+                <button class="btn btn-danger" onclick="confirmDeletePoll()">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Status Edit Modal -->
+    <div id="statusModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeStatusModal()">&times;</span>
+            <h2>Change Status</h2>
+            <div class="form-group">
+                <label>Address: <span id="statusAddress" style="font-weight:normal"></span></label>
+            </div>
+            <div class="form-group">
+                <label for="statusSelect">New Status:</label>
+                <select id="statusSelect">
+                    <option value="false">Ready</option>
+                    <option value="true">Suspended</option>
+                </select>
+            </div>
+            <div style="text-align: right;">
+                <button class="btn btn-secondary" onclick="closeStatusModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveStatus()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const token = urlParams.get('token');
+        const connStatus = document.getElementById('connection-status');
+
+        function fetchStatus() {
+            const headers = {};
+            if (token) {
+                headers['Authorization'] = 'Bearer ' + token;
+            }
+
+            fetch('/api/status', { headers: headers })
+                .then(response => {
+                    if (response.status === 401) {
+                        connStatus.textContent = "Unauthorized";
+                        connStatus.className = "badge badge-red";
+                        throw new Error("Unauthorized");
+                    }
+                    if (!response.ok) {
+                        throw new Error("Network response was not ok");
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    connStatus.textContent = "Connected";
+                    connStatus.className = "badge badge-green";
+                    document.getElementById('status-view').style.display = 'block';
+                    updateDashboard(data);
+                })
+                .catch(err => {
+                    console.error(err);
+                    if (connStatus.textContent !== "Unauthorized") {
+                        connStatus.textContent = "Disconnected";
+                        connStatus.className = "badge badge-red";
+                        document.getElementById('status-view').style.display = 'none';
+                    }
+                });
+        }
+
+        function updateDashboard(data) {
+            document.getElementById('sys-addr').textContent = data.address;
+            document.getElementById('sys-uptime').textContent = data.uptime;
+            document.getElementById('sys-ver').textContent = data.version;
+            document.getElementById('sys-scan').textContent = data.next_scan_in + "s";
+
+            const muteBtn = document.getElementById('btn-mute');
+            if (data.muted) {
+                muteBtn.textContent = "Unmute mailer";
+                muteBtn.className = "btn btn-danger";
+            } else {
+                muteBtn.textContent = "Mute mailer";
+                muteBtn.className = "btn btn-secondary";
+            }
+
+            // Update Sessions
+            const sessionsBody = document.querySelector('#sessions-table tbody');
+            let sessionsHtml = '';
+            
+            const activeSessions = data.sessions || {};
+            const recentSessions = data.recent_sessions || [];
+            const hasSessions = Object.keys(activeSessions).length > 0 || recentSessions.length > 0;
+
+            if (hasSessions) {
+                // Render Active Sessions
+                for (const id in activeSessions) {
+                    const s = activeSessions[id];
+                    const pct = s.file_size > 0 ? Math.round(s.file_pos/s.file_size*100) + '%' : '-';
+                    sessionsHtml += renderSessionRow(s, pct, '');
+                }
+                // Render Recent Sessions
+                recentSessions.forEach(s => {
+                    const style = 'opacity: 0.6; background-color: #f9f9f9;';
+                    sessionsHtml += renderSessionRow(s, '-', style);
+                });
+            } else {
+                 sessionsHtml = '<tr><td colspan="7" style="text-align:center; color: #777;">No recent sessions</td></tr>';
+            }
+            sessionsBody.innerHTML = sessionsHtml;
+
+            // Update Queue
+            const queueBody = document.querySelector('#queue-table tbody');
+            let queueHtml = '';
+            if (data.outbound_queue && data.outbound_queue.length > 0) {
+                data.outbound_queue.forEach(q => {
+                    let statusClass = '';
+                    let statusText = '';
+                    if (q.is_suspended) {
+                        statusClass = 'badge-red';
+                        statusText = 'Suspended';
+                    } else if (q.is_busy) {
+                        statusClass = 'badge-yellow';
+                        statusText = 'Busy';
+                    } else {
+                        statusClass = 'badge-green';
+                        statusText = 'Ready';
+                    }
+
+                    queueHtml += `<tr>
+                        <td>
+                            <a href="#" onclick="showNodeInfo('${q.address}'); return false;" style="text-decoration:none; color:inherit; border-bottom: 1px dashed #999;" title="View Node Info">${q.address}</a>
+                        </td>
+                        <td>
+                            <button onclick="editFlavor('${q.address}', '${q.flavor}')" style="background-color: #6c757d; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.85em;">${q.flavor}</button>
+                        </td>
+                        <td>${q.files}</td>
+                        <td>${formatBytes(q.netmail_size)}</td>
+                        <td>${formatBytes(q.echomail_size)}</td>
+                        <td>
+                            <button onclick="editStatus('${q.address}', ${q.is_suspended})" class="badge ${statusClass}" style="border: none; cursor: pointer; font-family: inherit;">${statusText}</button>
+                        </td>
+                        <td>
+                            <button onclick="deletePoll('${q.address}')" style="background-color: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.85em;">Delete</button>
+                        </td>
+                    </tr>`;
+                });
+            } else {
+                queueHtml = '<tr><td colspan="7" style="text-align:center; color: #777;">Queue empty</td></tr>';
+            }
+            queueBody.innerHTML = queueHtml;
+        }
+
+        function renderSessionRow(s, pct, style) {
+            const started = s.started_at ? new Date(s.started_at).toLocaleTimeString() : '-';
+            const duration = formatDuration(s.started_at, s.end_time);
+            
+            let stateClass = '';
+            if (s.state === 'Error') stateClass = 'badge-red';
+            else if (s.state === 'Busy') stateClass = 'badge-yellow';
+            else if (s.state === 'Finished') stateClass = 'badge-green';
+            else stateClass = 'badge-blue';
+
+            return `<tr style="${style}">
+                <td>${started}</td>
+                <td>${duration}</td>
+                <td><span class="badge ${s.direction === 'IN' ? 'badge-blue' : 'badge-green'}">${s.direction}</span></td>
+                <td>${s.remote}</td>
+                <td><span class="badge ${stateClass}">${s.state}</span></td>
+                <td>${s.current_file || '-'}</td>
+                <td>${pct}</td>
+            </tr>`;
+        }
+
+        function formatDuration(startStr, endStr) {
+            if (!startStr) return '-';
+            const start = new Date(startStr);
+            const end = endStr ? new Date(endStr) : new Date();
+            const diff = Math.floor((end - start) / 1000);
+            
+            if (diff < 0) return '0s';
+            if (diff < 60) return diff + 's';
+            const m = Math.floor(diff / 60);
+            const s = diff % 60;
+            if (m < 60) return `${m}m ${s}s`;
+            const h = Math.floor(m / 60);
+            const remM = m % 60;
+            return `${h}h ${remM}m`;
+        }
+
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0 || !bytes) return '0 B';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
+        function ansiToHtml(text) {
+            text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            const codes = {
+                '0': '</span>',
+                '1': '<span style="font-weight:bold">',
+                '2': '<span style="opacity:0.7">',
+                '30': '<span style="color:#adb5bd">',
+                '31': '<span style="color:#ff6b6b">',
+                '32': '<span style="color:#51cf66">',
+                '33': '<span style="color:#fcc419">',
+                '34': '<span style="color:#339af0">',
+                '35': '<span style="color:#cc5de8">',
+                '36': '<span style="color:#22b8cf">',
+                '37': '<span style="color:#ffffff">',
+            };
+            return text.replace(/\x1b\[(\d+)m/g, (match, code) => codes[code] || '');
+        }
+
+        function connectWebSocket() {
+            const logContent = document.getElementById('log-content');
+            const logView = document.getElementById('log-view');
+            const maxLogLines = 500;
+
+            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            let wsUrl = `${proto}//${window.location.host}/api/logstream`;
+            if (token) {
+                wsUrl += '?token=' + token;
+            }
+
+            const ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                console.log('Log stream connected.');
+                const line = document.createElement('div');
+                line.style.color = '#28a745';
+                line.textContent = '--- Connected to log stream ---';
+                logContent.appendChild(line);
+            };
+
+            ws.onmessage = function(event) {
+                const isScrolledToBottom = logView.scrollHeight - logView.clientHeight <= logView.scrollTop + 5;
+
+                const line = document.createElement('div');
+                line.innerHTML = ansiToHtml(event.data.trimEnd());
+                logContent.appendChild(line);
+
+                while (logContent.childNodes.length > maxLogLines) {
+                    logContent.removeChild(logContent.firstChild);
+                }
+
+                if (isScrolledToBottom) {
+                    logView.scrollTop = logView.scrollHeight;
+                }
+            };
+
+            ws.onclose = function() {
+                console.log('Log stream disconnected. Reconnecting in 3s...');
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        let currentDeleteAddress = '';
+
+        function deletePoll(address) {
+            currentDeleteAddress = address;
+            document.getElementById('deleteAddress').textContent = address;
+            document.getElementById('deleteFilesCheckbox').checked = false;
+            document.getElementById('deleteModal').style.display = "block";
+        }
+
+        function closeDeleteModal() {
+            document.getElementById('deleteModal').style.display = "none";
+        }
+
+        function confirmDeletePoll() {
+            const address = currentDeleteAddress;
+            const deleteFiles = document.getElementById('deleteFilesCheckbox').checked;
+            
+            const headers = {};
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            let url = `/api/queue/${address}`;
+            if (deleteFiles) {
+                url += '?delete_files=true';
+            }
+
+            fetch(url, {
+                method: 'DELETE',
+                headers: headers
+            })
+            .then(response => {
+                if (!response.ok) throw new Error('Failed to delete poll');
+                fetchStatus(); // Refresh immediately
+                closeDeleteModal();
+            })
+            .catch(err => alert('Error: ' + err.message));
+        }
+
+        function showNodeInfo(address) {
+            const headers = {};
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            fetch(`/api/nodelist/${address}`, { headers: headers })
+                .then(response => {
+                    if (!response.ok) throw new Error('Node not found in nodelist');
+                    return response.json();
+                })
+                .then(data => {
+                    document.getElementById('infoAddress').textContent = data.address;
+                    document.getElementById('infoSysop').textContent = data.sysop;
+                    document.getElementById('infoLocation').textContent = data.location;
+                    document.getElementById('infoFlags').textContent = data.flags.join(', ');
+                    document.getElementById('infoDNSRoot').textContent = data.dns_root;
+                    document.getElementById('infoDNS').textContent = data.dns || '-';
+                    document.getElementById('nodeInfoModal').style.display = "block";
+                })
+                .catch(err => alert('Error: ' + err.message));
+        }
+
+        function closeNodeInfoModal() {
+            document.getElementById('nodeInfoModal').style.display = "none";
+        }
+
+        let currentStatusAddress = '';
+
+        function editStatus(address, isSuspended) {
+            currentStatusAddress = address;
+            document.getElementById('statusAddress').textContent = address;
+            document.getElementById('statusSelect').value = isSuspended.toString();
+            document.getElementById('statusModal').style.display = "block";
+        }
+
+        function closeStatusModal() {
+            document.getElementById('statusModal').style.display = "none";
+        }
+
+        function saveStatus() {
+            const suspended = document.getElementById('statusSelect').value === 'true';
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            fetch(`/api/queue/${currentStatusAddress}`, {
+                method: 'PATCH',
+                headers: headers,
+                body: JSON.stringify({ suspended: suspended })
+            })
+            .then(res => {
+                if(res.ok) {
+                    fetchStatus(); // Refresh immediately
+                    closeStatusModal();
+                } else {
+                    alert('Failed to update status');
+                }
+            })
+            .catch(err => alert('Error: ' + err.message));
+        }
+
+        function openAddPollModal() {
+            document.getElementById('pollAddress').value = '';
+            document.getElementById('pollFlavor').value = 'normal';
+            document.getElementById('pollSuspended').checked = false;
+            document.getElementById('addPollModal').style.display = "block";
+            document.getElementById('pollAddress').focus();
+        }
+
+        function closeAddPollModal() {
+            document.getElementById('addPollModal').style.display = "none";
+        }
+
+        function submitAddPoll() {
+            const address = document.getElementById('pollAddress').value.trim();
+            const flavor = document.getElementById('pollFlavor').value;
+            const suspended = document.getElementById('pollSuspended').checked;
+
+            if (!address) {
+                alert('Please enter a node address');
+                return;
+            }
+
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            fetch('/api/control', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({
+                    action: 'queue_poll',
+                    address: address,
+                    flavor: flavor,
+                    suspended: suspended
+                })
+            })
+            .then(res => {
+                if (res.ok) {
+                    fetchStatus();
+                    closeAddPollModal();
+                } else {
+                    res.json().then(data => alert('Error: ' + data.message)).catch(() => alert('Failed to queue poll'));
+                }
+            })
+            .catch(err => alert('Error: ' + err.message));
+        }
+
+        let currentEditAddress = '';
+
+        function editFlavor(address, current) {
+            currentEditAddress = address;
+            document.getElementById('flavorAddress').textContent = address;
+            document.getElementById('flavorSelect').value = current;
+            document.getElementById('flavorModal').style.display = "block";
+        }
+
+        function closeFlavorModal() {
+            document.getElementById('flavorModal').style.display = "none";
+        }
+
+        function saveFlavor() {
+            const flavor = document.getElementById('flavorSelect').value;
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            fetch(`/api/queue/${currentEditAddress}`, {
+                method: 'PATCH',
+                headers: headers,
+                body: JSON.stringify({ flavor: flavor })
+            })
+            .then(res => {
+                if(res.ok) {
+                    fetchStatus();
+                    closeFlavorModal();
+                } else {
+                    alert('Failed to update flavor');
+                }
+            })
+            .catch(err => alert('Error: ' + err.message));
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const modal = document.getElementById('flavorModal');
+            const deleteModal = document.getElementById('deleteModal');
+            const statusModal = document.getElementById('statusModal');
+            const infoModal = document.getElementById('nodeInfoModal');
+            const addPollModal = document.getElementById('addPollModal');
+            if (event.target == modal) {
+                closeFlavorModal();
+            }
+            if (event.target == deleteModal) {
+                closeDeleteModal();
+            }
+            if (event.target == statusModal) {
+                closeStatusModal();
+            }
+            if (event.target == infoModal) {
+                closeNodeInfoModal();
+            }
+            if (event.target == addPollModal) {
+                closeAddPollModal();
+            }
+        }
+
+        function forceScan() {
+            sendControlAction('force_scan');
+        }
+
+        function reloadConfig() {
+            if(confirm("Reload configuration?")) {
+                sendControlAction('reload_config');
+            }
+        }
+
+        function toggleMute() {
+            const btn = document.getElementById('btn-mute');
+            const action = btn.textContent === "Mute mailer" ? "mute" : "unmute";
+            sendControlAction(action);
+        }
+
+        function sendControlAction(action) {
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            fetch('/api/control', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ action: action })
+            })
+            .then(res => {
+                if (res.ok) {
+                    fetchStatus();
+                } else {
+                    res.json().then(data => alert('Error: ' + data.message)).catch(() => alert('Failed to execute action'));
+                }
+            })
+            .catch(err => alert('Error: ' + err.message));
+        }
+
+        setInterval(fetchStatus, 2000);
+        fetchStatus();
+        connectWebSocket();
+    </script>
+</body>
+</html>

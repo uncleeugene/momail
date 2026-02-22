@@ -1,0 +1,14 @@
+# Version control
+.git
+.gitignore
+
+# Build artifacts
+momail
+*.exe
+*.test
+
+# Local runtime data (logs, mail queues, config)
+# We want to mount these at runtime, not bake them into the image
+run/
+*.log
+*.cache

@@ -1,0 +1,185 @@
+# MoMail Configuration File
+# =========================
+#
+# This is the main configuration file for the MoMail FTN mailer.
+# Rename this file to 'config.yaml' and adjust the settings to match your system.
+
+# -----------------------------------------------------------------------------
+# System Information
+# -----------------------------------------------------------------------------
+
+# Your primary FidoNet address (AKA).
+# Format: Zone:Net/Node[.Point]
+# Example: 2:5020/828.0
+address: "2:123/456.0"
+
+# The name of your system (BBS).
+system_name: "My Awesome BBS"
+
+# The name of the System Operator (SysOp).
+sysop: "John Doe"
+
+# Your physical location (City, Country).
+location: "City, Country"
+
+# Nodelist flags sent during the handshake (NDL).
+# Standard flags: TCP, BINKP, CM (Continuous Mail), etc.
+nodelist_flags: "115200,CM,TCP,BINKP"
+
+# -----------------------------------------------------------------------------
+# Security Settings
+# -----------------------------------------------------------------------------
+
+# If true, the mailer will refuse to send files to nodes that have not
+# authenticated with a password. This prevents accidental leakage of mail
+# to spoofed addresses.
+refuse_insecure_sending: true
+
+# -----------------------------------------------------------------------------
+# Network & Lookup Settings
+# -----------------------------------------------------------------------------
+
+# If true, DNS lookups for BinkP addresses will be disabled.
+disable_dns: false
+
+# The root domain for BinkP DNS lookups.
+# Default is "binkp.net".
+dns_root: "binkp.net"
+
+# The preferred method for looking up node addresses.
+# Options: "nodelist", "dns"
+# If the preferred method fails, the other method is tried as a fallback.
+lookup_method: "dns"
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+# Path to the main application log file.
+log_file: "./run/logs/momail.log"
+
+# Path to the session log file (brief summary of each session).
+session_log: "./run/logs/session.log"
+
+# Maximum size for each log file in Kilobytes (KB).
+# When this size is reached, you can use the --cut-logs command to rotate them.
+# Set to 0 for no limit.
+log_max_size: 10240 # 10MB
+
+# -----------------------------------------------------------------------------
+# Server Settings
+# -----------------------------------------------------------------------------
+
+# The TCP port for incoming BinkP connections.
+# Default is 24554 (IANA assigned for BinkP).
+port: 24554
+
+# The TCP port for the HTTP API and Web Dashboard.
+api_port: 8080
+
+# Secret token for API authentication.
+# If set, clients must provide this token in the Authorization header:
+# Authorization: Bearer <token>
+# Leave commented out to disable API authentication (not recommended for public servers).
+# api_token: "change_this_to_a_secure_random_string"
+
+# -----------------------------------------------------------------------------
+# Scheduler & Timing
+# -----------------------------------------------------------------------------
+
+# How often (in seconds) to rescan the outbound directory for new mail bundles.
+rescan_period: 60
+
+# Timeout (in seconds) for establishing an outgoing TCP connection.
+dial_timeout: 20
+
+# Number of failed dial attempts before a node is temporarily suspended (put on hold).
+max_dial_attempts: 3
+
+# Duration (in minutes) to keep a node suspended after max_dial_attempts is reached.
+hold_time: 60
+
+# Age (in hours) after which a stale .bsy (busy) lock file is automatically removed.
+stale_busy_timeout: 24
+
+# -----------------------------------------------------------------------------
+# Directories
+# -----------------------------------------------------------------------------
+
+# Directory for incoming files from unauthenticated (insecure) sessions.
+insecure_inbound: "./run/inbound/unprotected"
+
+# Directory for incoming files from authenticated (secure) sessions.
+secure_inbound: "./run/inbound"
+
+# Directory for temporary files currently being received.
+temp_inbound: "./run/inbound/temp"
+
+# Root directory for the outbound mail queue.
+# Structure: outbound/outbound.ZZZ/NNNNFFFF.pnt/
+outbound: "./run/outbound"
+
+# Directory for public files available for File Request (FREQ).
+freq_dir: "./run/freq"
+
+# -----------------------------------------------------------------------------
+# Nodelist Configuration
+# -----------------------------------------------------------------------------
+
+# Directory containing compiled or raw nodelist files.
+nodelist_dir: "./run/nodelist"
+
+# List of filename bases to load from the nodelist_dir.
+# The mailer will look for the file with the highest numeric extension
+# matching these bases (e.g., nodelist.365, r50pnt.001).
+nodelists:
+  - "nodelist"
+  - "r50pnt"
+
+# -----------------------------------------------------------------------------
+# Links (Remote Nodes)
+# -----------------------------------------------------------------------------
+# Define credentials and connection details for remote nodes here.
+
+links:
+  # Example Link 1: A secure link with a password
+  - address: "2:123/456.1"
+    host: "fido.example.com:24554"
+    password: "secret_password"
+    working_time: "CM" # CM = Continuous Mail (Always)
+
+  # Example Link 2: Another link with restricted calling hours
+  # - address: "2:123/999"
+  #   host: "192.168.1.50"
+  #   password: "another_secret"
+  #   working_time: "23:00-06:00"
+
+# -----------------------------------------------------------------------------
+# Triggers (File Events)
+# -----------------------------------------------------------------------------
+# Execute commands when specific files are received.
+
+triggers:
+  # Example: Create a semaphore file for a tosser (like HPT) when a packet arrives.
+  - masks: ["*.pkt"]
+    command: "touch ./run/inbound/pkt.sem"
+    run_after_session: true
+
+  - masks: ["*.tic"]
+    command: "touch ./run/inbound/tic.sem"
+    run_after_session: true
+
+# -----------------------------------------------------------------------------
+# Scheduled Tasks (Cron)
+# -----------------------------------------------------------------------------
+# Run maintenance commands at specific intervals.
+
+tasks:
+  # Example: Poll a specific uplink every hour to check for mail.
+  # The -q flag queues a poll request.
+  - cron_spec: "@hourly"
+    command: "./momail -q 2:123/456 -c ./run/config/config.yaml"
+
+  # Example: Run an external script daily
+  # - cron_spec: "@daily"
+  #   command: "/path/to/maintenance_script.sh"

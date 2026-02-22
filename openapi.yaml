@@ -1,0 +1,313 @@
+openapi: 3.0.0
+info:
+  title: MoMail API
+  description: API for monitoring and controlling the MoMail FTN mailer.
+  version: "0.1.0"
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /api/status:
+    get:
+      summary: Get Application Status
+      description: Returns a real-time snapshot of the mailer's status, including active sessions and uptime.
+      operationId: getStatus
+      responses:
+        '200':
+          description: Successful response with application status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppStatus'
+
+  /api/control:
+    post:
+      summary: Send Control Command
+      description: Executes a control command on the mailer, such as forcing a scan or queuing a poll.
+      operationId: sendControlCommand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlRequest'
+      responses:
+        '200':
+          description: Command executed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+        '400':
+          description: Bad Request (e.g., missing parameters, unknown action).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error (e.g., failed to create a file).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/queue:
+    get:
+      summary: Get Outbound Queue
+      description: Returns the current BSO outbound queue with status details.
+      operationId: getQueue
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/QueueEntry'
+
+  /api/queue/{address}:
+    parameters:
+      - in: path
+        name: address
+        schema:
+          type: string
+        required: true
+        description: FidoNet address (e.g. 2:5083/85.1)
+    delete:
+      summary: Delete Poll
+      description: Deletes the poll (flow files) for the specified node.
+      operationId: deletePoll
+      responses:
+        '200':
+          description: Poll deleted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+        '404':
+          description: Poll not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      summary: Update Node Status
+      description: Updates the flavor or suspension status of a node.
+      operationId: updateNode
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeUpdate'
+      responses:
+        '200':
+          description: Node updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+
+  /api/nodelist/{address}:
+    parameters:
+      - in: path
+        name: address
+        schema:
+          type: string
+        required: true
+        description: FidoNet address (e.g. 2:5083/85.1)
+    get:
+      summary: Get Nodelist Information
+      description: Retrieves information for a specific node from the loaded nodelist.
+      operationId: getNodeInfo
+      responses:
+        '200':
+          description: Successful response with node details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeInfo'
+        '404':
+          description: Node not found in nodelist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    QueueEntry:
+      type: object
+      properties:
+        address:
+          type: string
+          example: "2:5083/85.1"
+        flavor:
+          type: string
+          description: The flavor of the mail in queue (priority).
+          enum: [Crash, Direct, Hold, Normal]
+        files:
+          type: integer
+          description: Number of mail files in the queue.
+        netmail_size:
+          type: integer
+          format: int64
+          description: Total size of netmail bundles in bytes.
+        echomail_size:
+          type: integer
+          format: int64
+          description: Total size of echomail bundles in bytes.
+        is_suspended:
+          type: boolean
+          description: Whether the node is suspended (on hold).
+        is_busy:
+          type: boolean
+          description: Whether the node is currently busy/locked.
+
+    NodeUpdate:
+      type: object
+      properties:
+        flavor:
+          type: string
+          enum: [Crash, Direct, Hold, Normal]
+        suspended:
+          type: boolean
+
+    NodeInfo:
+      type: object
+      properties:
+        address:
+          type: string
+        sysop:
+          type: string
+        location:
+          type: string
+        flags:
+          type: array
+          items:
+            type: string
+        phone:
+            type: string
+        dns:
+          type: string
+          description: The resolved DNS address for the node.
+        dns_root:
+          type: string
+          description: The DNS root that was queried.
+
+    # Schemas for /api/status
+    SessionInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "127.0.0.1:54321"
+        remote:
+          type: string
+          example: "127.0.0.1:54321"
+        direction:
+          type: string
+          enum: [IN, OUT]
+        state:
+          type: string
+          example: "Receiving"
+        current_file:
+          type: string
+          example: "file.pkt"
+        file_pos:
+          type: integer
+          format: int64
+        file_size:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time
+        # next_attempt: # Removed as it's a scheduler concern, not session info
+        #   type: string
+        #   format: date-time
+        end_time:
+          type: string
+          format: date-time
+
+    AppStatus:
+      type: object
+      properties:
+        address:
+          type: string
+          example: "2:5020/828.0"
+        version:
+          type: string
+          example: "0.1"
+        uptime:
+          type: string
+          example: "1h2m3s"
+        sessions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SessionInfo'
+        recent_sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionInfo'
+        next_scan_in:
+          type: integer
+          description: Seconds until next scan
+        muted:
+          type: boolean
+        outbound_queue:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueueEntry'
+
+    # Schemas for /api/control
+    ControlRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          description: The control action to perform.
+          enum: [force_scan, queue_poll, run_task, mute, unmute, reload_config]
+        address:
+          type: string
+          description: The FidoNet address for 'queue_poll' action.
+          example: "2:5083/85.1"
+        flavor:
+          type: string
+          description: The flavor of poll file to create. Can be 'crash', 'direct', 'hold', or 'normal'.
+          default: "normal"
+        command:
+          type: string
+          description: The exact command string for 'run_task' action, as defined in config.
+          example: "echo 'Hourly check-in from momail scheduler'"
+      required:
+        - action
+
+    ControlResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "ok"
+        message:
+          type: string
+          example: "Outbound scan triggered"
+
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "error"
+        message:
+          type: string
+          example: "unknown action: invalid_action"
+
+security:
+  - bearerAuth: []
