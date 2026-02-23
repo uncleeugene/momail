@@ -13,7 +13,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -660,7 +659,8 @@ func (s *Session) executeTriggers(path string) {
 				continue
 			}
 			if matched && t.Command != "" {
-				cmdStr := strings.ReplaceAll(t.Command, "{file}", path)
+				// Use forward slashes for paths in commands for better cross-platform compatibility.
+				cmdStr := strings.ReplaceAll(t.Command, "{file}", filepath.ToSlash(path))
 				if t.RunAfterSession {
 					log.Println(logutil.Debug("Trigger match '%s': queueing for later '%s'\n", mask, cmdStr))
 					s.pendingCommands = append(s.pendingCommands, cmdStr)
@@ -684,9 +684,9 @@ func (s *Session) executePendingTriggers() {
 }
 
 func (s *Session) runCommand(cmdStr string) {
-	cmd := exec.Command("sh", "-c", cmdStr)
+	cmd := getShellCommand(cmdStr)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Println(logutil.Error("Trigger execution failed: %v\nOutput: %s\n", err, string(output)))
+		log.Println(logutil.Error("Trigger execution failed for command \"%s\": %v\nOutput: %s", cmdStr, err, string(output)))
 	}
 }
 
@@ -930,7 +930,8 @@ func (s *Session) logSummary(err error) {
 		duration.Round(time.Millisecond))
 
 	if s.config.SessionLog != "" {
-		f, err := os.OpenFile(s.config.SessionLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		// Use RotatableWriter to ensure session log is rotated if it exceeds size
+		f, err := logutil.NewRotatableWriter(s.config.SessionLog, s.config.LogMaxSize)
 		if err != nil {
 			log.Println(logutil.Error("Failed to open session log: %v", err))
 			// Fallback to main log on error

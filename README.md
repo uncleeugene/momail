@@ -4,7 +4,7 @@
 
 > ⚠️ **EARLY ALPHA WARNING** ⚠️
 >
-> This software is currently in **Early Alpha**. It is under active development. While it is functional, it may contain bugs, incomplete features, or breaking changes.
+> This software is currently in **Early Alpha**. It is under active development. While it is functional, it may and it will contain bugs, incomplete features, or breaking changes.
 >
 > **Do not use this in a production environment without proper backups and monitoring.**
 
@@ -93,10 +93,6 @@ MoMail can be run as a daemon to handle mail continuously, or as a one-off comma
     # Crash poll (.clo, highest priority)
     ./momail -q 2:5020/828 --crash
     ```
-*   **Rotate logs based on `log_max_size` in config:**
-    ```bash
-    ./momail --cut-logs
-    ```
 
 #### Dashboard
 MoMail includes a real-time web dashboard for monitoring sessions, queues, and logs.
@@ -125,3 +121,46 @@ docker run -d \
   -v $(pwd)/run:/app/run \
   --name momail \
   momail
+
+## Cross-Platform Notes
+
+MoMail is designed to be cross-platform and runs on Linux, macOS, and Windows.
+
+However, when defining `command` for `triggers` or `tasks` in your `config.yaml`, be aware that these commands are executed by the operating system's default shell.
+
+*   On **Linux/macOS** and other Unix-like systems, commands are executed via `sh -c "..."`.
+*   On **Windows**, commands are executed via `cmd /C "..."`.
+
+You must write your commands to be compatible with the target operating system's shell. For example, a simple file copy would be `cp source dest` on Linux but `copy source dest` on Windows.
+
+For convenience, the `{file}` placeholder in trigger commands will always have its path separators converted to forward slashes (`/`), which is compatible with both `sh` and modern `cmd.exe`/PowerShell.
+
+### Configuration Reloading
+
+MoMail supports reloading its configuration without restarting the daemon. The method depends on your operating system.
+
+*   On **Linux/macOS**, you can send the `SIGHUP` signal to the `momail` process to trigger a configuration reload.
+    ```bash
+    pkill -HUP momail
+    ```
+
+*   On **Windows**, signals like `SIGHUP` are not available. You can trigger a reload in two ways:
+    1.  **File Watching:** If you start the daemon with the `-w` or `--watch-config` flag, it will automatically reload when `config.yaml` is saved.
+    2.  **API Call:** You can send a request to the built-in HTTP API. This is useful for scripting or manual reloads. You can use `curl` (included in modern Windows) or PowerShell.
+
+        **Using `curl` (from Command Prompt):**
+        ```cmd
+        curl -X POST http://localhost:8080/api/control -H "Content-Type: application/json" -d "{\"command\": \"reload\"}"
+        ```
+
+        If you have set an `api_token` in your config, you must provide it as a Bearer token in the header:
+        ```cmd
+        curl -X POST http://localhost:8080/api/control -H "Authorization: Bearer YOUR_SECRET_TOKEN" -H "Content-Type: application/json" -d "{\"command\": \"reload\"}"
+        ```
+
+        **Using PowerShell:**
+        ```powershell
+        Invoke-RestMethod -Uri http://localhost:8080/api/control -Method Post -Body '{"command": "reload"}' -ContentType 'application/json'
+        # With an API token:
+        # Invoke-RestMethod -Uri http://localhost:8080/api/control -Method Post -Body '{"command": "reload"}' -ContentType 'application/json' -Headers @{"Authorization"="Bearer YOUR_SECRET_TOKEN"}
+        ```

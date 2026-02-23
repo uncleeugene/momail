@@ -62,8 +62,8 @@ log_file: "./run/logs/momail.log"
 session_log: "./run/logs/session.log"
 
 # Maximum size for each log file in Kilobytes (KB).
-# When this size is reached, you can use the --cut-logs command to rotate them.
-# Set to 0 for no limit.
+# When this size is reached, the log file is automatically rotated (renamed to .old).
+# Set to 0 to disable automatic rotation.
 log_max_size: 10240 # 10MB
 
 # -----------------------------------------------------------------------------

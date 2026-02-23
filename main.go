@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 
 	"github.com/acarl005/stripansi"
 	"github.com/fsnotify/fsnotify"
@@ -77,10 +75,6 @@ func main() {
 				Name:  "direct",
 				Usage: "Create a direct poll (.dlo) instead of a crash poll (.clo)",
 			},
-			&cli.BoolFlag{
-				Name:  "cut-logs",
-				Usage: "Cut log files to the size specified in config and exit",
-			},
 
 			&cli.BoolFlag{
 				Name:    "watch-config",
@@ -95,31 +89,17 @@ func main() {
 				return err
 			}
 
-			// Handle log cutting command and exit
-			if c.Bool("cut-logs") {
-				// Use a simple logger for this one-off command
-				log.SetOutput(os.Stdout)
-				log.SetFlags(0)
-				if err := cutLogs(cfg); err != nil {
-					// Use fmt to print to stderr since logging is basic
-					fmt.Fprintf(os.Stderr, "Error cutting logs: %v\n", err)
-					return err
-				}
-				return nil
-			}
-
 			monitor.SetNodeAddress(cfg.ParsedAddress.String())
 
 			// Setup Logging
-			logFile, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			logWriter, err := logutil.NewRotatableWriter(cfg.LogFile, cfg.LogMaxSize)
 			if err != nil {
-				return fmt.Errorf("failed to open log file: %w", err)
+				return fmt.Errorf("failed to initialize log writer: %w", err)
 			}
-			defer logFile.Close()
 
 			// Start the log streaming hub
 			go logstream.LogHub.Run()
-			log.SetOutput(io.MultiWriter(os.Stdout, &ansiStrippingWriter{writer: logFile}, logstream.LogHub))
+			log.SetOutput(io.MultiWriter(os.Stdout, &ansiStrippingWriter{writer: logWriter}, logstream.LogHub))
 
 			// Handle one-off commands that should exit immediately
 			isOneOffCommand := c.IsSet("queue-poll") || c.IsSet("poll")
@@ -196,87 +176,13 @@ func main() {
 	}
 
 	// Use a context that is cancelled on SIGINT/SIGTERM
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), getShutdownSignals()...)
 	defer stop()
 
 	err := app.RunContext(ctx, os.Args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
-}
-
-func cutLogs(cfg *config.Config) error {
-	if cfg.LogMaxSize <= 0 {
-		log.Println("log_max_size is not configured or is zero, skipping cut.")
-		return nil
-	}
-
-	maxSizeBytes := int64(cfg.LogMaxSize * 1024)
-
-	if err := cutLogFile(cfg.LogFile, maxSizeBytes); err != nil {
-		return fmt.Errorf("failed to cut main log file: %w", err)
-	}
-
-	if cfg.SessionLog != "" {
-		if err := cutLogFile(cfg.SessionLog, maxSizeBytes); err != nil {
-			return fmt.Errorf("failed to cut session log file: %w", err)
-		}
-	}
-
-	log.Println("Log cutting complete.")
-	return nil
-}
-
-func cutLogFile(path string, maxSize int64) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // File doesn't exist, nothing to do.
-		}
-		return err
-	}
-
-	if info.Size() <= maxSize {
-		return nil // File is smaller than the limit.
-	}
-
-	log.Printf("Cutting %s (size: %d KB) to %d KB...", path, info.Size()/1024, maxSize/1024)
-
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	if _, err := file.Seek(info.Size()-maxSize, io.SeekStart); err != nil {
-		return err
-	}
-
-	reader := bufio.NewReader(file)
-	// Read and discard the first (potentially partial) line to align to a newline
-	if _, err := reader.ReadBytes('\n'); err != nil && err != io.EOF {
-		return err
-	}
-
-	tempPath := path + ".tmp"
-	tempFile, err := os.Create(tempPath)
-	if err != nil {
-		return err
-	}
-
-	_, copyErr := io.Copy(tempFile, reader)
-	closeErr := tempFile.Close()
-
-	if copyErr != nil {
-		os.Remove(tempPath)
-		return copyErr
-	}
-	if closeErr != nil {
-		os.Remove(tempPath)
-		return closeErr
-	}
-
-	return os.Rename(tempPath, path)
 }
 
 func runDaemon(c *cli.Context, cfg *config.Config, cfgPath string) error {
@@ -291,26 +197,7 @@ func runDaemon(c *cli.Context, cfg *config.Config, cfgPath string) error {
 		go watchConfig(ctx, &wg, cfgPath, reloadChan)
 	}
 
-	// Listen for SIGHUP to reload config
-	hupChan := make(chan os.Signal, 1)
-	signal.Notify(hupChan, syscall.SIGHUP)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer signal.Stop(hupChan)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-hupChan:
-				log.Println(logutil.Info("Received SIGHUP. Triggering config reload..."))
-				select {
-				case reloadChan <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
+	setupSignalHandler(ctx, &wg, reloadChan)
 
 	isFirstRun := true
 	// Main lifecycle loop
