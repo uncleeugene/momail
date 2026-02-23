@@ -114,7 +114,7 @@ MoMail is designed to run in a container.
 # Build the image
 docker build -t momail .
    ```
-# Run the container (mounting your run directory)
+#### Run the container (mounting your run directory)
 ```bash
 docker run -d \
   -p 24554:24554 \
