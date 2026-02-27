@@ -14,8 +14,8 @@ import (
 // Dial initiates a BinkP connection to a remote link.
 func Dial(cfg *config.Config, link *config.Link) error {
 	host := link.Host
-	if !strings.Contains(host, ":") {
-		host = fmt.Sprintf("%s:24554", host)
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(strings.Trim(host, "[]"), "24554")
 	}
 
 	log.Println(logutil.Info("Dialing %s (%s)...", link.Address, host))
