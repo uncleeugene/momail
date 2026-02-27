@@ -152,8 +152,8 @@ def main():
 
 
     # --- Output ---
-    print(f"\nMailer's Log Report for 2:5083/85")
-    print(f"Window: {args.hours} hours (ending {last_entry_time})")
+    print(f"\n Mailer's statistics")
+    print(f" Totals for {args.hours} hours (ending {last_entry_time})")
     print("=" * width)
     print(f"Total Sessions: {total_sessions}")
     print(f"  Incoming:     {by_direction['IN']:<5}  Success: {by_status['OK']}")
@@ -162,6 +162,7 @@ def main():
     print(f"Traffic:")
     print(f"  Received:     {format_bytes(total_r_bytes)}")
     print(f"  Sent:         {format_bytes(total_s_bytes)}")
+    print(f"\n Link summary:")
     print("=" * width)
     
     print(f"{'Address':<22} | {'Sess':<4} | {'Err':<3} | {'Recv':<10} | {'Sent':<10} | {'Avg Time':<8}")
@@ -171,9 +172,10 @@ def main():
         print(f"{addr:<22} | {stats['count']:<4} | {stats['err']:<3} | {format_bytes(stats['r_bytes']):<10} | {format_bytes(stats['s_bytes']):<10} | {avg_time:.2f}s")
     print("=" * width)
 
-    print("\nSession Activity (Time on X, Link on Y)")
+    print(f"\n Graph (X - Failed; # - Succeeeded)")
+    print("=" * width)
     
-    addr_width = 22
+    addr_width = 18
     graph_width = width - addr_width - 3
     
     start_time = cutoff_time
@@ -220,8 +222,7 @@ def main():
                     ruler[col+1] = h[1]
         t += timedelta(hours=1)
         
-    print(f"{' ' * addr_width}   {''.join(ruler)}")
-    print(f"{'Address':<{addr_width}} | Graph (X=Err, #=OK)")
+    print(f"{'Address':<{addr_width}} | {''.join(ruler)}")
     print("-" * width)
     
     for addr, _ in sorted(link_stats.items(), key=lambda x: x[1]['count'], reverse=True):
@@ -230,6 +231,8 @@ def main():
     
     print("-" * width)
     print(f"Range: {start_time.strftime('%Y-%m-%d %H:%M')} - {end_time.strftime('%H:%M')}")
+    print("=" * width)
+    print(f"\n")
 
 if __name__ == "__main__":
     main()
