@@ -15,7 +15,7 @@ MoMail is a fresh take on the classic FTN mailer, designed for the modern age. B
 ## Key Features
 
 *   **Modern Core:** Written in pure Go (Golang) for performance and portability.
-*   **BinkP 1.1 Support:** Full implementation of the BinkP protocol, including CRAM-MD5 authentication and GZIP compression (negotiated).
+*   **BinkP 1.0 Support:** Full implementation of the BinkP protocol, including CRAM-MD5 authentication. (Not fully completed yet)
 *   **Smart Routing:**
     *   Standard Binkley-style outbound directory structure (BSO).
     *   Supports 4D addressing (Zone:Net/Node.Point).
