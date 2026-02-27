@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"uncleeugene.kz/momail/config"
@@ -55,6 +56,7 @@ type RequestedFile struct {
 	Path        string
 	SendAs      string // Optional: name to send as. If empty, uses filename.
 	DeleteAfter bool   // If true, delete file after sending.
+	Offset      int64  // Starting offset for partial transfers.
 }
 
 // Session handles the state of a BinkP connection.
@@ -63,6 +65,7 @@ type Session struct {
 	config *config.Config
 	reader *bufio.Reader
 	id     string
+	dir    string // "incoming" or "outgoing"
 
 	// Receive state
 	currentFile   *os.File
@@ -88,6 +91,15 @@ type Session struct {
 	// pendingCommands holds triggers to be executed after session
 	pendingCommands []string
 
+	// Concurrency control for full-duplex
+	wg                sync.WaitGroup
+	shutdown          chan struct{}
+	handshakeComplete chan struct{}
+	handshakeOnce     sync.Once
+	eobMutex          sync.Mutex
+	weSentEOB         bool
+	theySentEOB       bool
+
 	// requestedFiles holds paths to files requested by the remote system
 	requestedFiles []RequestedFile
 
@@ -100,14 +112,17 @@ type Session struct {
 }
 
 // NewSession creates a new BinkP session.
-func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link) *Session {
+func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link, direction string) *Session {
 	return &Session{
-		conn:       conn,
-		config:     cfg,
-		reader:     bufio.NewReader(conn),
-		remoteLink: remoteLink,
-		id:         conn.RemoteAddr().String(),
-		startTime:  time.Now(),
+		conn:              conn,
+		config:            cfg,
+		dir:               direction,
+		reader:            bufio.NewReader(conn),
+		remoteLink:        remoteLink,
+		id:                conn.RemoteAddr().String(),
+		startTime:         time.Now(),
+		shutdown:          make(chan struct{}),
+		handshakeComplete: make(chan struct{}),
 	}
 }
 
@@ -119,6 +134,9 @@ func (s *Session) Run() (err error) {
 
 	s.updateMonitor("Handshake", "", 0, 0)
 	defer func() {
+		close(s.shutdown) // 1. Signal sender to stop
+		s.wg.Wait()       // 2. Wait for sender to finish
+
 		if s.currentFile != nil {
 			s.currentFile.Close()
 		}
@@ -132,30 +150,79 @@ func (s *Session) Run() (err error) {
 		s.updateMonitor(finalState, "", 0, 0)
 		monitor.UnregisterSession(s.id)
 		if OnSessionEnd != nil {
-			OnSessionEnd(err == nil)
+			OnSessionEnd(err == nil || err == errSessionFinished)
 		}
 	}()
 
-	// 1. Send Handshake (SYS info and Address)
+	// 1. Send our part of the handshake
 	if err := s.sendHandshake(); err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	// 2. Main Loop
+	// 2. Start the sender goroutine. It will wait for the handshake to complete.
+	s.wg.Add(1)
+	go s.fileSender()
+
+	// 3. The main goroutine becomes the reader. This will block until the session ends.
+	err = s.fileReader()
+
+	// If reader returns a clean exit, we should not report it as an error upstream.
+	if err == errSessionFinished {
+		return nil
+	}
+	return err
+}
+
+func (s *Session) fileSender() {
+	defer s.wg.Done()
+
+	// Wait for the handshake to be completed (i.e., we've received M_ADR from remote)
+	// or for the session to be shut down.
+	select {
+	case <-s.handshakeComplete:
+		log.Println(logutil.Debug("Handshake complete, starting sender."))
+	case <-s.shutdown:
+		return
+	case <-time.After(60 * time.Second): // Add a timeout for the handshake
+		log.Println(logutil.Error("Sender timeout: Did not receive remote M_ADR within 60s."))
+		s.conn.Close() // Force the reader to exit
+		return
+	}
+
+	// It's our turn to send.
+	s.updateMonitor("Sending", "", 0, 0)
+	if err := s.sendFiles(); err != nil {
+		// A sending error should terminate the session.
+		log.Println(logutil.Error("Error during send: %v. Closing session.", err))
+		s.conn.Close() // Force the reader to exit
+	} else {
+		s.eobMutex.Lock()
+		s.weSentEOB = true
+		theyAreDone := s.theySentEOB
+		s.eobMutex.Unlock()
+		if theyAreDone {
+			log.Println(logutil.Debug("Both sides sent EOB, closing connection."))
+			s.conn.Close()
+		}
+	}
+}
+
+func (s *Session) fileReader() error {
 	for {
 		s.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		isCmd, payload, err := s.readFrame()
 		if err != nil {
 			if err == io.EOF {
-				return nil // Connection closed cleanly
+				return nil // Connection closed cleanly by remote
 			}
 			return err
 		}
 
 		if isCmd {
 			if err := s.handleCommand(payload); err != nil {
+				// errSessionFinished is a signal for a clean exit.
 				if err == errSessionFinished {
-					return nil // Clean exit
+					return err
 				}
 				return err
 			}
@@ -168,6 +235,13 @@ func (s *Session) Run() (err error) {
 }
 
 func (s *Session) sendHandshake() error {
+
+	// First thingo send is MD5 challenge for CRAM-MD5 authentication if the remote supports it.
+	// This is a common extension and allows us to do mutual authentication without sending
+	// passwords in plain text.
+	s.ourChallenge = generateChallenge()
+	s.writeCommand(M_NUL, "OPT CRAM-MD5-"+s.ourChallenge)
+
 	// M_NUL is used for system info. Format: "KEY Value"
 	// Standard BinkP info keys
 	if s.config.SystemName != "" {
@@ -185,8 +259,6 @@ func (s *Session) sendHandshake() error {
 	s.writeCommand(M_NUL, "VER momail v0.1. binkp/1.0")
 
 	// CRAM-MD5: Send our challenge
-	s.ourChallenge = generateChallenge()
-	s.writeCommand(M_NUL, "OPT CRAM-MD5-"+s.ourChallenge)
 
 	// M_ADR sends our address list
 	if err := s.writeCommand(M_ADR, s.config.ParsedAddress.String()); err != nil {
@@ -270,6 +342,9 @@ func (s *Session) handleCommand(payload []byte) error {
 			}
 		}
 
+		// Signal that the handshake is complete enough for the sender to start.
+		s.handshakeOnce.Do(func() { close(s.handshakeComplete) })
+
 		// Update monitor with the new address
 		s.updateMonitor("Handshake", "", 0, 0)
 
@@ -288,7 +363,7 @@ func (s *Session) handleCommand(payload []byte) error {
 					s.sendCramResponse(link.Password)
 				} else if s.remoteChallenge == "" && !s.pwdSent && link.Password != "" {
 					// Fallback to plain text mutual auth if remote didn't send challenge
-					s.writeCommand(M_PWD, link.Password)
+					//s.writeCommand(M_PWD, link.Password)
 					s.pwdSent = true
 				}
 			}
@@ -401,13 +476,16 @@ func (s *Session) handleGet(args string) error {
 		return nil
 	}
 
-	// M_GET arguments: name [size] [time] [offset]
-	// We only care about the name for now.
+	// M_GET arguments: name [size] [time] [offset].
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
 		return nil
 	}
 	name := parts[0]
+	var offset int64
+	if len(parts) > 3 {
+		offset, _ = strconv.ParseInt(parts[3], 10, 64)
+	}
 
 	if strings.EqualFold(name, "FILES") {
 		return s.handleMagicFiles()
@@ -432,8 +510,8 @@ func (s *Session) handleGet(args string) error {
 		return nil
 	}
 
-	log.Println(logutil.Info("Queuing requested file: %s", name))
-	s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: absPath})
+	log.Println(logutil.Info("Queuing requested file: %s (offset: %d)", name, offset))
+	s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: absPath, Offset: offset})
 	return nil
 }
 
@@ -538,6 +616,10 @@ func (s *Session) handleFile(args string) error {
 	if len(parts) > 2 {
 		timestamp = parts[2]
 	}
+	var offset int64
+	if len(parts) > 3 {
+		offset, _ = strconv.ParseInt(parts[3], 10, 64)
+	}
 
 	// Security: Ensure we only write to the temp directory
 	baseName := filepath.Base(name)
@@ -546,17 +628,45 @@ func (s *Session) handleFile(args string) error {
 	}
 	tmpPath := filepath.Join(s.config.TempInbound, baseName)
 
-	f, err := os.Create(tmpPath)
+	var f *os.File
+	var err error
+
+	if offset > 0 {
+		// Attempt to resume
+		info, statErr := os.Stat(tmpPath)
+		if statErr == nil && info.Size() == offset {
+			// Valid resume
+			log.Println(logutil.Info("Resuming download for %s at offset %d", baseName, offset))
+			f, err = os.OpenFile(tmpPath, os.O_WRONLY, 0644)
+			if err == nil {
+				_, err = f.Seek(offset, io.SeekStart)
+			}
+		} else {
+			// Invalid resume conditions
+			if statErr != nil {
+				log.Println(logutil.Warn("Cannot resume %s: temp file not found. Starting from beginning.", baseName))
+			} else {
+				log.Println(logutil.Warn("Cannot resume %s: offset mismatch (expected %d, got %d). Starting from beginning.", baseName, offset, info.Size()))
+			}
+			// Fallback to creating a new file
+			offset = 0
+			f, err = os.Create(tmpPath)
+		}
+	} else {
+		// Start from beginning
+		f, err = os.Create(tmpPath)
+	}
+
 	if err != nil {
 		s.writeCommand(M_SKIP, name) // Tell remote to skip this file
-		return fmt.Errorf("failed to create file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to open/create file %s: %w", tmpPath, err)
 	}
 
 	s.currentFile = f
 	s.recvName = baseName
 	s.recvTimestamp = timestamp
 	s.recvSize = size
-	s.recvBytes = 0
+	s.recvBytes = offset // Start counting from the offset
 
 	s.updateMonitor("Receiving", baseName, 0, size)
 	log.Println(logutil.Warn("Receiving %s (%d bytes)...", baseName, size))
@@ -594,10 +704,21 @@ func (s *Session) handleEOB() error {
 		}
 	}
 
-	// It's our turn to send.
-	log.Println(logutil.Info("-> Remote finished sending. Starting outbound queue..."))
-	s.updateMonitor("Sending", "", 0, 0)
-	return s.sendFiles()
+	log.Println(logutil.Info("-> Remote finished sending (M_EOB)."))
+
+	s.eobMutex.Lock()
+	s.theySentEOB = true
+	weAreDone := s.weSentEOB
+	s.eobMutex.Unlock()
+
+	if weAreDone {
+		log.Println(logutil.Debug("Both sides sent EOB, closing connection."))
+		// We can close the connection here, but returning errSessionFinished
+		// allows for a more graceful shutdown of the reader loop.
+		return errSessionFinished
+	}
+
+	return nil
 }
 
 func (s *Session) finishCurrentFile() error {
@@ -708,17 +829,12 @@ func (s *Session) sendFiles() error {
 
 	// 1. Send requested files (FREQ)
 	for _, req := range s.requestedFiles {
-		if err := s.sendFile(req.Path, req.SendAs); err != nil {
+		if err := s.sendFile(req.Path, req.SendAs, req.Offset); err != nil {
 			return err
 		}
 		if req.DeleteAfter {
 			os.Remove(req.Path)
 		}
-	}
-
-	if len(s.remoteAddrs) == 0 {
-		s.writeCommand(M_EOB, "")
-		return errSessionFinished
 	}
 
 	// Iterate over all addresses the remote node claims to have
@@ -732,10 +848,11 @@ func (s *Session) sendFiles() error {
 	}
 
 	// We are done sending.
+	log.Println(logutil.Info("-> Finished sending outbound queue."))
 	if err := s.writeCommand(M_EOB, ""); err != nil {
 		return err
 	}
-	return errSessionFinished
+	return nil
 }
 
 // FlowFileInfo holds information about a found flow file.
@@ -817,7 +934,7 @@ func (s *Session) processFlowFile(flowPath string) error {
 		}
 
 		// Send the file
-		if err := s.sendFile(path, ""); err != nil {
+		if err := s.sendFile(path, "", 0); err != nil {
 			// If the file is missing, we just skip it (and it will be removed from flow later)
 			// If it's a network error, we return it to abort the session.
 			if os.IsNotExist(err) {
@@ -839,7 +956,7 @@ func (s *Session) processFlowFile(flowPath string) error {
 	return nil
 }
 
-func (s *Session) sendFile(path string, sendAs string) error {
+func (s *Session) sendFile(path string, sendAs string, offset int64) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -849,11 +966,16 @@ func (s *Session) sendFile(path string, sendAs string) error {
 	if name == "" {
 		name = filepath.Base(path)
 	}
-	log.Println(logutil.Warn("Sending %s (%d bytes)...", name, info.Size()))
-	s.updateMonitor("Sending", name, 0, info.Size())
+
+	if offset > 0 {
+		log.Println(logutil.Warn("Resuming send for %s (%d bytes) at offset %d...", name, info.Size(), offset))
+	} else {
+		log.Println(logutil.Warn("Sending %s (%d bytes)...", name, info.Size()))
+	}
+	s.updateMonitor("Sending", name, offset, info.Size())
 
 	// M_FILE: "name size timestamp offset"
-	fileArgs := fmt.Sprintf("%s %d %d 0", name, info.Size(), info.ModTime().Unix())
+	fileArgs := fmt.Sprintf("%s %d %d %d", name, info.Size(), info.ModTime().Unix(), offset)
 	if err := s.writeCommand(M_FILE, fileArgs); err != nil {
 		return err
 	}
@@ -864,8 +986,14 @@ func (s *Session) sendFile(path string, sendAs string) error {
 	}
 	defer f.Close()
 
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek in file %s: %w", path, err)
+		}
+	}
+
 	buf := make([]byte, 4096)
-	var sentBytes int64
+	sentBytes := offset
 	for {
 		n, err := f.Read(buf)
 		if err != nil {

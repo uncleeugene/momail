@@ -25,6 +25,6 @@ func Dial(cfg *config.Config, link *config.Link) error {
 		return fmt.Errorf("failed to connect to %s: %w", host, err)
 	}
 
-	session := NewSession(conn, cfg, link)
+	session := NewSession(conn, cfg, link, "outgoing")
 	return session.Run()
 }
