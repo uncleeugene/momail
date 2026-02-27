@@ -92,13 +92,11 @@ type Session struct {
 	pendingCommands []string
 
 	// Concurrency control for full-duplex
-	wg                sync.WaitGroup
-	shutdown          chan struct{}
-	handshakeComplete chan struct{}
-	handshakeOnce     sync.Once
-	eobMutex          sync.Mutex
-	weSentEOB         bool
-	theySentEOB       bool
+	wg          sync.WaitGroup
+	shutdown    chan struct{}
+	eobMutex    sync.Mutex
+	weSentEOB   bool
+	theySentEOB bool
 
 	// requestedFiles holds paths to files requested by the remote system
 	requestedFiles []RequestedFile
@@ -114,16 +112,182 @@ type Session struct {
 // NewSession creates a new BinkP session.
 func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link, direction string) *Session {
 	return &Session{
-		conn:              conn,
-		config:            cfg,
-		dir:               direction,
-		reader:            bufio.NewReader(conn),
-		remoteLink:        remoteLink,
-		id:                conn.RemoteAddr().String(),
-		startTime:         time.Now(),
-		shutdown:          make(chan struct{}),
-		handshakeComplete: make(chan struct{}),
+		conn:       conn,
+		config:     cfg,
+		dir:        direction,
+		reader:     bufio.NewReader(conn),
+		remoteLink: remoteLink,
+		id:         conn.RemoteAddr().String(),
+		startTime:  time.Now(),
+		shutdown:   make(chan struct{}),
 	}
+}
+
+func (s *Session) performHandshake() error {
+	log.Println(logutil.Debug("Starting handshake..."))
+	s.updateMonitor("Handshake", "", 0, 0)
+
+	// Send our initial info
+	if err := s.sendHandshake(); err != nil {
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	var remoteSentADR, authDone bool
+
+	// Handshake loop: continues until we have the remote's address and authentication is resolved.
+	for !remoteSentADR || !authDone {
+		s.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		isCmd, payload, err := s.readFrame()
+		if err != nil {
+			return fmt.Errorf("handshake read failed: %w", err)
+		}
+		if !isCmd {
+			return fmt.Errorf("protocol error: received data frame during handshake")
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		cmd := payload[0]
+		data := string(payload[1:])
+
+		switch cmd {
+		case M_NUL:
+			log.Println(logutil.Muted("[Remote] INFO: %s", data))
+			var challenge string
+			if strings.HasPrefix(data, "CRAM-MD5-") {
+				challenge = data[9:]
+			} else if strings.HasPrefix(data, "OPT ") {
+				for _, part := range strings.Fields(data) {
+					if strings.HasPrefix(part, "CRAM-MD5-") {
+						challenge = part[9:]
+						break
+					}
+				}
+			}
+			if challenge != "" {
+				s.remoteChallenge = challenge
+				// If we are outgoing and haven't sent PWD, send CRAM response now
+				if s.remoteLink != nil && !s.pwdSent {
+					s.sendCramResponse(s.remoteLink.Password)
+				}
+			}
+		case M_ADR:
+			log.Println(logutil.Remote("[Remote] ADR: %s", data))
+			parts := strings.Fields(data)
+			for _, p := range parts {
+				if idx := strings.Index(p, "@"); idx != -1 {
+					p = p[:idx]
+				}
+				if addr, err := ftn.ParseFidoAddress(p, s.config.ParsedAddress.Zone); err == nil {
+					s.remoteAddrs = append(s.remoteAddrs, addr)
+				}
+			}
+			remoteSentADR = true
+			s.updateMonitor("Handshake", "", 0, 0)
+
+			// Now that we have their address, we can determine auth state.
+			if s.dir == "outgoing" {
+				if s.remoteLink != nil && !s.pwdSent {
+					if s.remoteChallenge == "" && s.remoteLink.Password != "" {
+						// Fallback to plain password if CRAM is not offered by remote
+						s.writeCommand(M_PWD, s.remoteLink.Password)
+						s.pwdSent = true
+					} else if s.remoteLink.Password == "" {
+						// Outgoing to a link with no password. Auth is complete.
+						log.Println(logutil.Info("Outgoing session to password-less link, auth complete."))
+						s.activeLink = s.remoteLink
+						authDone = true
+					}
+				}
+			} else { // This is an incoming session
+				link := s.findLink()
+				if link == nil {
+					log.Println(logutil.Warn("No link found for remote address. Session is unauthenticated."))
+					authDone = true
+				} else if link.Password == "" {
+					log.Println(logutil.Info("Link found with no password required. Session is authenticated."))
+					s.activeLink = link
+					authDone = true
+				} else if s.remoteChallenge != "" && !s.pwdSent {
+					// Link requires a password, and remote sent a challenge. Respond for mutual auth.
+					if link.Password != "" {
+						s.sendCramResponse(link.Password)
+					}
+				}
+			}
+		case M_PWD:
+			log.Println(logutil.Remote("[Remote] PWD: *****"))
+			link := s.findLink()
+			if link == nil {
+				log.Println(logutil.Warn("Unknown node (no address match), treating as unprotected session"))
+				s.writeCommand(M_OK, "Unprotected session")
+				authDone = true
+				continue
+			}
+
+			if link.Password == "" {
+				s.activeLink = link
+				s.writeCommand(M_OK, "Password not required")
+				log.Println(logutil.Success("-> No password required for this link, accepted"))
+				authDone = true
+				continue
+			}
+
+			valid := false
+			if strings.HasPrefix(data, "CRAM-MD5-") {
+				digest := data[9:]
+				mac := hmac.New(md5.New, []byte(link.Password))
+				challengeBytes, err := hex.DecodeString(s.ourChallenge)
+				if err != nil {
+					challengeBytes = []byte(s.ourChallenge)
+				}
+				mac.Write(challengeBytes)
+				expected := hex.EncodeToString(mac.Sum(nil))
+
+				if strings.EqualFold(digest, expected) {
+					valid = true
+				} else {
+					mac2 := hmac.New(md5.New, []byte(link.Password))
+					mac2.Write([]byte(s.ourChallenge))
+					expected2 := hex.EncodeToString(mac2.Sum(nil))
+					if strings.EqualFold(digest, expected2) {
+						valid = true
+					} else {
+						log.Println(logutil.Debug("CRAM-MD5 mismatch"))
+					}
+				}
+			} else if data == link.Password {
+				valid = true
+			}
+
+			if valid {
+				s.activeLink = link
+				s.writeCommand(M_OK, "Password accepted")
+				log.Println(logutil.Success("-> Password accepted"))
+				authDone = true
+			} else {
+				s.writeCommand(M_ERR, "Bad password")
+				return fmt.Errorf("authentication failed: bad password")
+			}
+		case M_OK:
+			log.Println(logutil.Muted("[Remote] OK: %s", data))
+			if s.remoteLink != nil && s.pwdSent && s.activeLink == nil {
+				s.activeLink = s.remoteLink
+				log.Println(logutil.Success("-> Remote accepted password, session considered protected"))
+				authDone = true
+			}
+		case M_ERR:
+			return fmt.Errorf("handshake failed, remote error: %s", data)
+		case M_BSY:
+			return ErrRemoteBusy
+		default:
+			log.Println(logutil.Warn("Received unexpected command %d during handshake", cmd))
+		}
+	}
+
+	log.Println(logutil.Success("Handshake complete."))
+	return nil
 }
 
 // Run starts the BinkP protocol loop.
@@ -132,10 +296,9 @@ func (s *Session) Run() (err error) {
 		return fmt.Errorf("system is muted")
 	}
 
-	s.updateMonitor("Handshake", "", 0, 0)
 	defer func() {
-		close(s.shutdown) // 1. Signal sender to stop
-		s.wg.Wait()       // 2. Wait for sender to finish
+		// Ensure the connection is always closed when the session ends.
+		s.conn.Close()
 
 		if s.currentFile != nil {
 			s.currentFile.Close()
@@ -154,42 +317,36 @@ func (s *Session) Run() (err error) {
 		}
 	}()
 
-	// 1. Send our part of the handshake
-	if err := s.sendHandshake(); err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+	// 1. Synchronous Handshake & Authentication
+	if err = s.performHandshake(); err != nil {
+		return err // The defer will handle logging this error
 	}
 
-	// 2. Start the sender goroutine. It will wait for the handshake to complete.
+	// Handshake is complete and session is authenticated (or determined to be insecure).
+	// `s.activeLink` is now definitively set if applicable.
+
+	// 2. Start concurrent file transfers
 	s.wg.Add(1)
 	go s.fileSender()
 
-	// 3. The main goroutine becomes the reader. This will block until the session ends.
-	err = s.fileReader()
+	// 3. This goroutine becomes the file reader
+	readerErr := s.fileReader()
 
-	// If reader returns a clean exit, we should not report it as an error upstream.
-	if err == errSessionFinished {
-		return nil
+	// 4. Signal sender to stop and wait for it to finish
+	close(s.shutdown)
+	s.wg.Wait()
+
+	// 5. Determine final error state
+	if readerErr != nil && readerErr != errSessionFinished {
+		err = readerErr
 	}
-	return err
+
+	return err // The named return `err` will be used by the defer
 }
 
 func (s *Session) fileSender() {
 	defer s.wg.Done()
 
-	// Wait for the handshake to be completed (i.e., we've received M_ADR from remote)
-	// or for the session to be shut down.
-	select {
-	case <-s.handshakeComplete:
-		log.Println(logutil.Debug("Handshake complete, starting sender."))
-	case <-s.shutdown:
-		return
-	case <-time.After(60 * time.Second): // Add a timeout for the handshake
-		log.Println(logutil.Error("Sender timeout: Did not receive remote M_ADR within 60s."))
-		s.conn.Close() // Force the reader to exit
-		return
-	}
-
-	// It's our turn to send.
 	s.updateMonitor("Sending", "", 0, 0)
 	if err := s.sendFiles(); err != nil {
 		// A sending error should terminate the session.
@@ -214,6 +371,16 @@ func (s *Session) fileReader() error {
 		if err != nil {
 			if err == io.EOF {
 				return nil // Connection closed cleanly by remote
+			}
+
+			// When the fileSender determines the session is complete, it closes the
+			// connection to unblock this fileReader. We check if this was an expected
+			// closure and, if so, treat it as a clean exit, not an error.
+			s.eobMutex.Lock()
+			isFinished := s.weSentEOB && s.theySentEOB
+			s.eobMutex.Unlock()
+			if isFinished && errors.Is(err, net.ErrClosed) {
+				return nil // This was a clean shutdown signal from the sender.
 			}
 			return err
 		}
@@ -309,128 +476,6 @@ func (s *Session) handleCommand(payload []byte) error {
 	data := string(payload[1:])
 
 	switch cmd {
-	case M_NUL:
-		log.Println(logutil.Muted("[Remote] INFO: %s", data))
-		var challenge string
-		if strings.HasPrefix(data, "CRAM-MD5-") {
-			challenge = data[9:]
-		} else if strings.HasPrefix(data, "OPT ") {
-			for _, part := range strings.Fields(data) {
-				if strings.HasPrefix(part, "CRAM-MD5-") {
-					challenge = part[9:]
-					break
-				}
-			}
-		}
-		if challenge != "" {
-			s.remoteChallenge = challenge
-			// If we are outgoing and haven't sent PWD, send CRAM response now
-			if s.remoteLink != nil && !s.pwdSent {
-				s.sendCramResponse(s.remoteLink.Password)
-			}
-		}
-	case M_ADR:
-		log.Println(logutil.Remote("[Remote] ADR: %s", data))
-		parts := strings.Fields(data)
-		for _, p := range parts {
-			// Strip domain if present (e.g. 2:5020/828@fidonet)
-			if idx := strings.Index(p, "@"); idx != -1 {
-				p = p[:idx]
-			}
-			if addr, err := ftn.ParseFidoAddress(p, s.config.ParsedAddress.Zone); err == nil {
-				s.remoteAddrs = append(s.remoteAddrs, addr)
-			}
-		}
-
-		// Signal that the handshake is complete enough for the sender to start.
-		s.handshakeOnce.Do(func() { close(s.handshakeComplete) })
-
-		// Update monitor with the new address
-		s.updateMonitor("Handshake", "", 0, 0)
-
-		// If outgoing (we have a target link), check if we need to send password now (fallback to plain)
-		if s.remoteLink != nil && !s.pwdSent && s.remoteChallenge == "" {
-			if s.remoteLink.Password != "" {
-				s.writeCommand(M_PWD, s.remoteLink.Password)
-				s.pwdSent = true
-			}
-		}
-
-		// If incoming, try to identify link and respond to challenge if present (mutual auth)
-		if s.activeLink == nil {
-			if link := s.findLink(); link != nil {
-				if s.remoteChallenge != "" && !s.pwdSent {
-					s.sendCramResponse(link.Password)
-				} else if s.remoteChallenge == "" && !s.pwdSent && link.Password != "" {
-					// Fallback to plain text mutual auth if remote didn't send challenge
-					//s.writeCommand(M_PWD, link.Password)
-					s.pwdSent = true
-				}
-			}
-		}
-	case M_PWD:
-		log.Println(logutil.Remote("[Remote] PWD: *****"))
-		link := s.findLink()
-		if link == nil {
-			// Unknown link, allow as insecure
-			log.Println(logutil.Warn("Unknown node (no address match), treating as unprotected session"))
-			s.writeCommand(M_OK, "Unprotected session")
-			return nil
-		}
-
-		// If a link is configured but has no password, it's a valid session.
-		if link.Password == "" {
-			s.activeLink = link
-			s.writeCommand(M_OK, "Password not required")
-			log.Println(logutil.Success("-> No password required for this link, accepted"))
-			return nil
-		}
-
-		valid := false
-		if strings.HasPrefix(data, "CRAM-MD5-") {
-			digest := data[9:]
-			mac := hmac.New(md5.New, []byte(link.Password))
-
-			// Method 1: Standard (Decode Hex Challenge)
-			challengeBytes, err := hex.DecodeString(s.ourChallenge)
-			if err != nil {
-				challengeBytes = []byte(s.ourChallenge)
-			}
-			mac.Write(challengeBytes)
-			expected := hex.EncodeToString(mac.Sum(nil))
-
-			if strings.EqualFold(digest, expected) {
-				valid = true
-			} else {
-				// Method 2: Fallback (Raw ASCII Challenge)
-				mac2 := hmac.New(md5.New, []byte(link.Password))
-				mac2.Write([]byte(s.ourChallenge))
-				expected2 := hex.EncodeToString(mac2.Sum(nil))
-				if strings.EqualFold(digest, expected2) {
-					valid = true
-				} else {
-					log.Println(logutil.Debug("CRAM-MD5 mismatch"))
-				}
-			}
-		} else if data == link.Password {
-			valid = true
-		}
-
-		if valid {
-			s.activeLink = link
-			s.writeCommand(M_OK, "Password accepted")
-			log.Println(logutil.Success("-> Password accepted"))
-		} else {
-			s.writeCommand(M_ERR, "Bad password")
-			return fmt.Errorf("authentication failed: bad password")
-		}
-	case M_OK:
-		log.Println(logutil.Muted("[Remote] OK: %s", data))
-		// If we are dialing out and the remote accepted our password, consider the session authenticated.
-		if s.remoteLink != nil && s.pwdSent && s.activeLink == nil {
-			s.activeLink = s.remoteLink
-			log.Println(logutil.Success("-> Remote accepted password, session considered protected"))
-		}
 	case M_FILE:
 		return s.handleFile(data)
 	case M_EOB:
@@ -444,7 +489,7 @@ func (s *Session) handleCommand(payload []byte) error {
 	case M_GET:
 		return s.handleGet(data)
 	default:
-		log.Println(logutil.Muted("[Remote] CMD %d: %s", cmd, data))
+		log.Println(logutil.Warn("[Remote] Unexpected CMD %d: %s", cmd, data))
 	}
 	return nil
 }
