@@ -44,7 +44,7 @@ jobs:
         PKG_NAME="momail-${{ matrix.os }}-${{ matrix.arch }}"
         mkdir -p "$PKG_NAME"
         go build -v -trimpath -ldflags="-s -w" -o "$PKG_NAME/momail${{ matrix.ext }}" .
-        cp config.yaml.dist momail.service README.md "$PKG_NAME/"
+        cp config.yaml.dist momail.service README.md analyze_logs.py "$PKG_NAME/"
         zip -r "dist/$PKG_NAME.zip" "$PKG_NAME"
 
     - name: Upload Artifacts
