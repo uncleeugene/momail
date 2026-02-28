@@ -27,6 +27,8 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+const Version = "0.1.1-alpha"
+
 // ansiStrippingWriter is an io.Writer that strips ANSI escape codes
 // before writing to the underlying writer.
 type ansiStrippingWriter struct {
@@ -47,6 +49,11 @@ func main() {
 		Name:  "momail",
 		Usage: "A modern FidoNet Technology Network (FTN) mailer",
 		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "version",
+				Aliases: []string{"v"},
+				Usage:   "Print version information and exit",
+			},
 			&cli.StringFlag{
 				Name:    "config",
 				Aliases: []string{"c"},
@@ -83,12 +90,19 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
+
+			if c.Bool("version") {
+				fmt.Println("momail v" + Version)
+				return nil
+			}
+
 			cfgPath := c.String("config")
 			cfg, err := config.Load(cfgPath)
 			if err != nil {
 				return err
 			}
 
+			cfg.Version = Version
 			monitor.SetNodeAddress(cfg.ParsedAddress.String())
 
 			// Setup Logging
@@ -202,7 +216,7 @@ func runDaemon(c *cli.Context, cfg *config.Config, cfgPath string) error {
 	isFirstRun := true
 	// Main lifecycle loop
 	for {
-		log.Println(logutil.Success("momail starting up..."))
+		log.Println(logutil.Success("momail v%s starting up...", cfg.Version))
 		log.Println(logutil.Info("-> Node Address: %s", cfg.ParsedAddress.String()))
 		log.Println(logutil.Info("-> Outbound Dir: %s", cfg.Outbound))
 

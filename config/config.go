@@ -142,6 +142,8 @@ type Config struct {
 	// ParsedAddress is the parsed version of the Address field.
 	// It is not loaded from yaml directly.
 	ParsedAddress *ftn.FidoAddress `yaml:"-"`
+
+	Version string `yaml:"-"`
 }
 
 // Load reads a YAML file from the given path and returns a Config struct.

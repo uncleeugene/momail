@@ -2,6 +2,8 @@
 momail
 momail.exe
 *.test
+momail.yaml
+config.yaml
 
 # Local Runtime Data
 # Ignore the run directory containing logs, queues, and local config

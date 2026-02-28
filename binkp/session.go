@@ -23,7 +23,6 @@ import (
 	"uncleeugene.kz/momail/ftn"
 	"uncleeugene.kz/momail/logutil"
 	"uncleeugene.kz/momail/monitor"
-	"uncleeugene.kz/momail/nodelist"
 )
 
 // BinkP Commands (v1.0+)
@@ -61,11 +60,11 @@ type RequestedFile struct {
 
 // Session handles the state of a BinkP connection.
 type Session struct {
-	conn   net.Conn
-	config *config.Config
-	reader *bufio.Reader
-	id     string
-	dir    string // "incoming" or "outgoing"
+	conn       net.Conn
+	config     *config.Config
+	reader     *bufio.Reader
+	id         string
+	isOutgoing bool
 
 	// Receive state
 	currentFile   *os.File
@@ -110,11 +109,15 @@ type Session struct {
 }
 
 // NewSession creates a new BinkP session.
-func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link, direction string) *Session {
+func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link) *Session {
+	var isOut bool
+	if remoteLink != nil {
+		isOut = true
+	}
 	return &Session{
 		conn:       conn,
 		config:     cfg,
-		dir:        direction,
+		isOutgoing: isOut,
 		reader:     bufio.NewReader(conn),
 		remoteLink: remoteLink,
 		id:         conn.RemoteAddr().String(),
@@ -169,6 +172,7 @@ func (s *Session) performHandshake() error {
 				s.remoteChallenge = challenge
 				// If we are outgoing and haven't sent PWD, send CRAM response now
 				if s.remoteLink != nil && !s.pwdSent {
+					log.Println(logutil.Debug("Remote supports CRAM-MD5, sending challenge response..."))
 					s.sendCramResponse(s.remoteLink.Password)
 				}
 			}
@@ -187,7 +191,7 @@ func (s *Session) performHandshake() error {
 			s.updateMonitor("Handshake", "", 0, 0)
 
 			// Now that we have their address, we can determine auth state.
-			if s.dir == "outgoing" {
+			if s.isOutgoing {
 				if s.remoteLink != nil && !s.pwdSent {
 					if s.remoteChallenge == "" && s.remoteLink.Password != "" {
 						// Fallback to plain password if CRAM is not offered by remote
@@ -217,7 +221,7 @@ func (s *Session) performHandshake() error {
 				}
 			}
 		case M_PWD:
-			log.Println(logutil.Remote("[Remote] PWD: *****"))
+			log.Println(logutil.Remote("[Remote] Presented password"))
 			link := s.findLink()
 			if link == nil {
 				log.Println(logutil.Warn("Unknown node (no address match), treating as unprotected session"))
@@ -229,7 +233,7 @@ func (s *Session) performHandshake() error {
 			if link.Password == "" {
 				s.activeLink = link
 				s.writeCommand(M_OK, "Password not required")
-				log.Println(logutil.Success("-> No password required for this link, accepted"))
+				log.Println(logutil.Success("No password required for this link, accepted"))
 				authDone = true
 				continue
 			}
@@ -237,6 +241,7 @@ func (s *Session) performHandshake() error {
 			valid := false
 			if strings.HasPrefix(data, "CRAM-MD5-") {
 				digest := data[9:]
+
 				mac := hmac.New(md5.New, []byte(link.Password))
 				challengeBytes, err := hex.DecodeString(s.ourChallenge)
 				if err != nil {
@@ -264,7 +269,7 @@ func (s *Session) performHandshake() error {
 			if valid {
 				s.activeLink = link
 				s.writeCommand(M_OK, "Password accepted")
-				log.Println(logutil.Success("-> Password accepted"))
+				log.Println(logutil.Success("Password accepted"))
 				authDone = true
 			} else {
 				s.writeCommand(M_ERR, "Bad password")
@@ -274,7 +279,7 @@ func (s *Session) performHandshake() error {
 			log.Println(logutil.Muted("[Remote] OK: %s", data))
 			if s.remoteLink != nil && s.pwdSent && s.activeLink == nil {
 				s.activeLink = s.remoteLink
-				log.Println(logutil.Success("-> Remote accepted password, session considered protected"))
+				log.Println(logutil.Success("-> Remote accepted session parameters, session is authenticated."))
 				authDone = true
 			}
 		case M_ERR:
@@ -406,8 +411,10 @@ func (s *Session) sendHandshake() error {
 	// First thingo send is MD5 challenge for CRAM-MD5 authentication if the remote supports it.
 	// This is a common extension and allows us to do mutual authentication without sending
 	// passwords in plain text.
-	s.ourChallenge = generateChallenge()
-	s.writeCommand(M_NUL, "OPT CRAM-MD5-"+s.ourChallenge)
+	if !s.isOutgoing {
+		s.ourChallenge = generateChallenge()
+		s.writeCommand(M_NUL, "OPT CRAM-MD5-"+s.ourChallenge)
+	}
 
 	// M_NUL is used for system info. Format: "KEY Value"
 	// Standard BinkP info keys
@@ -423,7 +430,7 @@ func (s *Session) sendHandshake() error {
 	// NDL: NodeList flags/capabilities
 	s.writeCommand(M_NUL, "NDL "+s.config.NodelistFlags)
 	// VER: Software version
-	s.writeCommand(M_NUL, "VER momail v0.1. binkp/1.0")
+	s.writeCommand(M_NUL, "VER momail v"+s.config.Version+" binkp/1.0")
 
 	// CRAM-MD5: Send our challenge
 
@@ -503,9 +510,11 @@ func (s *Session) sendCramResponse(password string) error {
 	if err != nil {
 		challengeBytes = []byte(s.remoteChallenge)
 	}
+
 	mac.Write(challengeBytes)
 	digest := hex.EncodeToString(mac.Sum(nil))
 	s.pwdSent = true
+
 	return s.writeCommand(M_PWD, "CRAM-MD5-"+digest)
 }
 
@@ -532,14 +541,6 @@ func (s *Session) handleGet(args string) error {
 		offset, _ = strconv.ParseInt(parts[3], 10, 64)
 	}
 
-	if strings.EqualFold(name, "FILES") {
-		return s.handleMagicFiles()
-	}
-
-	if strings.EqualFold(name, "NODELIST") {
-		return s.handleMagicNodelist()
-	}
-
 	// Security: Prevent directory traversal
 	cleanPath := filepath.Clean(filepath.Join(s.config.FreqDir, name))
 	absFileBox, _ := filepath.Abs(s.config.FreqDir)
@@ -560,65 +561,6 @@ func (s *Session) handleGet(args string) error {
 	return nil
 }
 
-func (s *Session) handleMagicFiles() error {
-	if err := os.MkdirAll(s.config.TempInbound, 0755); err != nil {
-		log.Println(logutil.Error("Failed to create temp dir for magic file: %v", err))
-		return nil
-	}
-
-	f, err := os.CreateTemp(s.config.TempInbound, "FILES-*.LST")
-	if err != nil {
-		log.Println(logutil.Error("Failed to create magic file listing: %v", err))
-		return nil
-	}
-	defer f.Close()
-
-	fmt.Fprintf(f, "File listing for %s\r\n", s.config.SystemName)
-	fmt.Fprintf(f, "-------------------------------------------------------------------------------\r\n")
-
-	entries, err := os.ReadDir(s.config.FreqDir)
-	if err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				info, _ := entry.Info()
-				fmt.Fprintf(f, "%-30s %10d  %s\r\n", entry.Name(), info.Size(), info.ModTime().Format("2006-01-02 15:04"))
-			}
-		}
-	} else {
-		fmt.Fprintf(f, "Error reading filebox: %v\r\n", err)
-	}
-	fmt.Fprintf(f, "-------------------------------------------------------------------------------\r\n")
-
-	log.Println(logutil.Info("Queuing magic file: FILES"))
-	s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: f.Name(), SendAs: "FILES.LST", DeleteAfter: true})
-	return nil
-}
-
-func (s *Session) handleMagicNodelist() error {
-	if s.config.NodelistDir == "" {
-		log.Println(logutil.Warn("Remote requested NODELIST but nodelist_dir is not configured"))
-		return nil
-	}
-
-	// Try to find "nodelist" first as it is the standard name
-	path, err := nodelist.FindLatest(s.config.NodelistDir, "nodelist")
-
-	// If not found, and we have configured nodelists, try the first one
-	if err != nil && len(s.config.Nodelists) > 0 {
-		if !strings.EqualFold(s.config.Nodelists[0], "nodelist") {
-			path, err = nodelist.FindLatest(s.config.NodelistDir, s.config.Nodelists[0])
-		}
-	}
-
-	if err == nil && path != "" {
-		log.Println(logutil.Info("Queuing magic file: NODELIST -> %s", filepath.Base(path)))
-		s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: path})
-	} else {
-		log.Println(logutil.Warn("Remote requested NODELIST but no suitable file found in %s", s.config.NodelistDir))
-	}
-	return nil
-}
-
 // findLink attempts to find a configured link that matches one of the
 // remote system's addresses.
 func (s *Session) findLink() *config.Link {
@@ -628,7 +570,8 @@ func (s *Session) findLink() *config.Link {
 			// Compare Zone, Net, Node. Ignore point for link matching.
 			if link.ParsedAddress.Zone == remoteAddr.Zone &&
 				link.ParsedAddress.Net == remoteAddr.Net &&
-				link.ParsedAddress.Node == remoteAddr.Node {
+				link.ParsedAddress.Node == remoteAddr.Node &&
+				link.ParsedAddress.Point == remoteAddr.Point {
 				return link
 			}
 		}
@@ -749,7 +692,7 @@ func (s *Session) handleEOB() error {
 		}
 	}
 
-	log.Println(logutil.Info("-> Remote finished sending (M_EOB)."))
+	log.Println(logutil.Info("Remote finished sending (M_EOB)."))
 
 	s.eobMutex.Lock()
 	s.theySentEOB = true
@@ -893,7 +836,7 @@ func (s *Session) sendFiles() error {
 	}
 
 	// We are done sending.
-	log.Println(logutil.Info("-> Finished sending outbound queue."))
+	log.Println(logutil.Info("Finished sending outbound queue."))
 	if err := s.writeCommand(M_EOB, ""); err != nil {
 		return err
 	}

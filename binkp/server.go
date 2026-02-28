@@ -48,7 +48,7 @@ func handleConnection(conn net.Conn, cfg *config.Config) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Println(logutil.Info("Incoming connection from %s", remoteAddr))
 
-	session := NewSession(conn, cfg, nil, "incoming")
+	session := NewSession(conn, cfg, nil)
 	if err := session.Run(); err != nil {
 		log.Println(logutil.Error("Session error with %s: %v", remoteAddr, err))
 	}
