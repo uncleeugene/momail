@@ -279,7 +279,7 @@ func (s *Session) performHandshake() error {
 			log.Println(logutil.Muted("[Remote] OK: %s", data))
 			if s.remoteLink != nil && s.pwdSent && s.activeLink == nil {
 				s.activeLink = s.remoteLink
-				log.Println(logutil.Success("-> Remote accepted session parameters, session is authenticated."))
+				log.Println(logutil.Success("Remote accepted session parameters, session is authenticated."))
 				authDone = true
 			}
 		case M_ERR:

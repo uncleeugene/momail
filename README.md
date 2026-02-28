@@ -12,6 +12,8 @@
 
 MoMail is a fresh take on the classic FTN mailer, designed for the modern age. Built with Go, it offers a single-binary deployment, low resource usage, and a built-in web dashboard for easy monitoring. It implements the BinkP protocol to exchange mail packets and files with other nodes in FidoNet and compatible networks.
 
+![console screeenshot](screenshots/console.png)
+
 ## Key Features
 
 *   **Modern Core:** Written in pure Go (Golang) for performance and portability.
@@ -96,6 +98,8 @@ MoMail can be run as a daemon to handle mail continuously, or as a one-off comma
 
 #### Dashboard
 MoMail includes a real-time web dashboard for monitoring sessions, queues, and logs.
+
+![dashboard screenshot](screenshots/dashboard.png)
 
 1.  **Open in Browser:** `http://localhost:8080/dashboard`
 2.  **Authentication:** If you set an `api_token` in `config.yaml`, append it to the URL:
