@@ -267,7 +267,6 @@ func ScanAndPoll(cfg *config.Config) {
 					failureCounts[entry.Address] = 0
 				}
 				lastAttemptTime[entry.Address] = time.Now()
-				lastAttemptTime[entry.Address] = time.Now()
 
 				if bsyPath != "" {
 					os.Remove(bsyPath)

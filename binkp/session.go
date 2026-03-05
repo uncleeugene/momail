@@ -100,12 +100,22 @@ type Session struct {
 	// requestedFiles holds paths to files requested by the remote system
 	requestedFiles []RequestedFile
 
+	// sentFileMap tracks files sent during this session to handle resumes (M_GET)
+	// and confirmed deletions (M_GOT). Maps sent-as filename to info.
+	sentFileMap map[string]SentFileInfo
+
 	// Statistics
 	startTime     time.Time
 	filesReceived int
 	bytesReceived int64
 	filesSent     int
 	bytesSent     int64
+}
+
+// SentFileInfo tracks information about a file sent during the session.
+type SentFileInfo struct {
+	OriginalPath string
+	DeleteAfter  bool
 }
 
 // NewSession creates a new BinkP session.
@@ -115,14 +125,15 @@ func NewSession(conn net.Conn, cfg *config.Config, remoteLink *config.Link) *Ses
 		isOut = true
 	}
 	return &Session{
-		conn:       conn,
-		config:     cfg,
-		isOutgoing: isOut,
-		reader:     bufio.NewReader(conn),
-		remoteLink: remoteLink,
-		id:         conn.RemoteAddr().String(),
-		startTime:  time.Now(),
-		shutdown:   make(chan struct{}),
+		conn:        conn,
+		config:      cfg,
+		isOutgoing:  isOut,
+		reader:      bufio.NewReader(conn),
+		remoteLink:  remoteLink,
+		id:          conn.RemoteAddr().String(),
+		startTime:   time.Now(),
+		shutdown:    make(chan struct{}),
+		sentFileMap: make(map[string]SentFileInfo),
 	}
 }
 
@@ -495,6 +506,8 @@ func (s *Session) handleCommand(payload []byte) error {
 		return ErrRemoteBusy
 	case M_GET:
 		return s.handleGet(data)
+	case M_GOT:
+		return s.handleGot(data)
 	default:
 		log.Println(logutil.Warn("[Remote] Unexpected CMD %d: %s", cmd, data))
 	}
@@ -524,10 +537,33 @@ func generateChallenge() string {
 	return hex.EncodeToString(b)
 }
 
+func (s *Session) handleGot(args string) error {
+	// M_GOT args: filename size timestamp
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		return nil
+	}
+	filename := parts[0]
+
+	if info, ok := s.sentFileMap[filename]; ok {
+		log.Println(logutil.Success("Remote confirmed receipt of %s.", filename))
+		if info.DeleteAfter {
+			log.Println(logutil.Debug("Deleting original file: %s", info.OriginalPath))
+			if err := os.Remove(info.OriginalPath); err != nil {
+				// Log error but don't kill session. Maybe file was already gone.
+				log.Println(logutil.Warn("Failed to delete file after sending: %v", err))
+			}
+		}
+	} else {
+		log.Println(logutil.Warn("Received M_GOT for unknown file: %s", filename))
+	}
+	return nil
+}
+
 func (s *Session) handleGet(args string) error {
 	if s.config.FreqDir == "" {
-		log.Println(logutil.Warn("Remote requested file '%s' but filebox is disabled", args))
-		return nil
+		// Even if filebox is disabled, this could be a resume request for a file we sent.
+		// We'll check for that first.
 	}
 
 	// M_GET arguments: name [size] [time] [offset].
@@ -539,6 +575,22 @@ func (s *Session) handleGet(args string) error {
 	var offset int64
 	if len(parts) > 3 {
 		offset, _ = strconv.ParseInt(parts[3], 10, 64)
+	}
+
+	// First, check if this is a request to resume a file we just sent.
+	if info, ok := s.sentFileMap[name]; ok {
+		if _, err := os.Stat(info.OriginalPath); err == nil {
+			log.Println(logutil.Info("Queuing requested resume for %s (original: %s, offset: %d)", name, filepath.Base(info.OriginalPath), offset))
+			s.requestedFiles = append(s.requestedFiles, RequestedFile{Path: info.OriginalPath, SendAs: name, Offset: offset, DeleteAfter: info.DeleteAfter})
+			return nil
+		}
+		log.Println(logutil.Warn("Remote requested resume for %s, but original file %s is gone.", name, info.OriginalPath))
+	}
+
+	// If it wasn't a resume request, now we check the filebox.
+	if s.config.FreqDir == "" {
+		log.Println(logutil.Warn("Remote requested file '%s' but filebox is disabled and it's not a resume request", name))
+		return nil
 	}
 
 	// Security: Prevent directory traversal
@@ -817,16 +869,23 @@ func (s *Session) sendFiles() error {
 
 	// 1. Send requested files (FREQ)
 	for _, req := range s.requestedFiles {
-		if err := s.sendFile(req.Path, req.SendAs, req.Offset); err != nil {
+		if err := s.sendFile(req.Path, req.SendAs, req.Offset, req.DeleteAfter); err != nil {
 			return err
-		}
-		if req.DeleteAfter {
-			os.Remove(req.Path)
 		}
 	}
 
 	// Iterate over all addresses the remote node claims to have
 	for _, addr := range s.remoteAddrs {
+		netmails := s.processNetmail(s.config, addr)
+		for _, item := range netmails {
+			if err := s.sendFile(item.Path, item.Filename, 0, true); err != nil {
+				if os.IsNotExist(err) {
+					log.Println(logutil.Warn("Netmail file disappeared before sending: %s", item.Path))
+					continue
+				}
+				return err
+			}
+		}
 		flowFiles := FindFlowFiles(s.config, addr)
 		for _, flowFile := range flowFiles {
 			if err := s.processFlowFile(flowFile.Path); err != nil {
@@ -879,24 +938,62 @@ func FindFlowFiles(cfg *config.Config, remote *ftn.FidoAddress) []FlowFileInfo {
 	// 3. Check extensions in priority order
 	extMap := map[string]string{
 		".clo": "Crash",
-		".cut": "Crash",
 		".dlo": "Direct",
-		".dut": "Direct",
 		".hlo": "Hold",
-		".hut": "Hold",
-		".lo":  "Normal",
-		".out": "Normal",
 		".flo": "Normal",
-		".fut": "Normal",
 	}
 	// Check in priority order
-	for _, ext := range []string{".clo", ".cut", ".dlo", ".dut", ".hlo", ".hut", ".lo", ".out", ".flo", ".fut"} {
+	for _, ext := range []string{".clo", ".dlo", ".hlo", ".flo"} {
 		path := filepath.Join(baseDir, nameBase+ext)
 		if _, err := os.Stat(path); err == nil {
 			flows = append(flows, FlowFileInfo{Path: path, State: extMap[ext]})
 		}
 	}
 	return flows
+}
+
+type NetmailQueueItem struct {
+	Path     string
+	Filename string // The name to send the file as (e.g. a random .pkt name)
+}
+
+func (s *Session) processNetmail(cfg *config.Config, remote *ftn.FidoAddress) []NetmailQueueItem {
+	var files []NetmailQueueItem
+
+	// 1. Determine Base Directory
+	// If zones match: outbound/outbound
+	// If zones differ: outbound/outbound.ZZZ (hex zone)
+	var baseDir string
+	if remote.Zone == cfg.DefaultZone {
+		baseDir = filepath.Join(cfg.Outbound, "outbound")
+	} else {
+		baseDir = filepath.Join(cfg.Outbound, fmt.Sprintf("outbound.%03x", remote.Zone))
+	}
+
+	// 2. Determine Filename Base
+	var nameBase string
+	if remote.Point != 0 {
+		// Points: outbound/NNNNFFFF.pnt/0000PPPP
+		// NNNN=Net, FFFF=Node, PPPP=Point (all hex)
+		dir := filepath.Join(baseDir, fmt.Sprintf("%04x%04x.pnt", remote.Net, remote.Node))
+		baseDir = dir
+		nameBase = fmt.Sprintf("0000%04x", remote.Point)
+	} else {
+		// Nodes: outbound/NNNNFFFF
+		nameBase = fmt.Sprintf("%04x%04x", remote.Net, remote.Node)
+	}
+
+	// Check in priority order
+	for _, ext := range []string{".cut", ".dut", ".hut", ".out"} {
+		path := filepath.Join(baseDir, nameBase+ext)
+		if _, err := os.Stat(path); err == nil {
+			// Netmail bundles are sent as randomly named packet files. To ensure
+			// compatibility with older systems (like DOS), the name should be 8.3.
+			randomName := fmt.Sprintf("%x.pkt", uint32(time.Now().UnixNano()))
+			files = append(files, NetmailQueueItem{Path: path, Filename: randomName})
+		}
+	}
+	return files
 }
 
 func (s *Session) processFlowFile(flowPath string) error {
@@ -922,7 +1019,7 @@ func (s *Session) processFlowFile(flowPath string) error {
 		}
 
 		// Send the file
-		if err := s.sendFile(path, "", 0); err != nil {
+		if err := s.sendFile(path, "", 0, deleteAfter); err != nil {
 			// If the file is missing, we just skip it (and it will be removed from flow later)
 			// If it's a network error, we return it to abort the session.
 			if os.IsNotExist(err) {
@@ -930,11 +1027,6 @@ func (s *Session) processFlowFile(flowPath string) error {
 				continue
 			}
 			return err
-		}
-
-		// If successful and marked for deletion
-		if deleteAfter {
-			os.Remove(path)
 		}
 	}
 
@@ -944,7 +1036,7 @@ func (s *Session) processFlowFile(flowPath string) error {
 	return nil
 }
 
-func (s *Session) sendFile(path string, sendAs string, offset int64) error {
+func (s *Session) sendFile(path string, sendAs string, offset int64, deleteAfter bool) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -953,6 +1045,12 @@ func (s *Session) sendFile(path string, sendAs string, offset int64) error {
 	name := sendAs
 	if name == "" {
 		name = filepath.Base(path)
+	}
+
+	// Add to the map for potential M_GET and M_GOT handling
+	s.sentFileMap[name] = SentFileInfo{
+		OriginalPath: path,
+		DeleteAfter:  deleteAfter,
 	}
 
 	if offset > 0 {
